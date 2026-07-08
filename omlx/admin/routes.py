@@ -37,8 +37,11 @@ from ..utils.release_check import normalize_update_channel, select_latest_releas
 from .auth import (
     REMEMBER_ME_MAX_AGE,
     SESSION_MAX_AGE,
+    check_login_rate_limit,
+    clear_login_attempts,
     compare_keys,
     create_session_token,
+    record_failed_login,
     require_admin,
     validate_api_key,
     verify_api_key,
@@ -1444,7 +1447,7 @@ async def admin_static(path: str):
 
 
 @router.post("/api/login")
-async def login(request: LoginRequest, response: Response):
+async def login(request: LoginRequest, http_request: Request, response: Response):
     """
     Authenticate with API key and create session.
 
@@ -1453,14 +1456,19 @@ async def login(request: LoginRequest, response: Response):
 
     Args:
         request: LoginRequest containing the API key.
+        http_request: FastAPI Request, used to key the failed-login lockout.
         response: FastAPI response object for setting cookies.
 
     Returns:
         JSON response with success status.
 
     Raises:
-        HTTPException: 400 if no API key configured, 401 if invalid.
+        HTTPException: 400 if no API key configured, 401 if invalid,
+            429 if too many recent failed attempts from this client.
     """
+    client_key = http_request.client.host if http_request.client else "unknown"
+    check_login_rate_limit(client_key)
+
     global_settings = _get_global_settings()
     server_api_key = global_settings.auth.api_key if global_settings else None
 
@@ -1473,10 +1481,13 @@ async def login(request: LoginRequest, response: Response):
 
     # Main key only — sub keys must not grant admin login
     if not verify_api_key(request.api_key, server_api_key):
+        record_failed_login(client_key)
         raise HTTPException(
             status_code=401,
             detail="Invalid API key",
         )
+
+    clear_login_attempts(client_key)
 
     # Create session token and set cookie
     token = create_session_token(remember=request.remember)

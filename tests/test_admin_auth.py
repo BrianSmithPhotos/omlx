@@ -493,3 +493,62 @@ class TestCheckUpdate:
 
         assert result["update_available"] is False
         assert result["latest_version"] is None
+
+
+class TestLoginRateLimit:
+    """Tests for the failed-login lockout (jundot/omlx#925)."""
+
+    def setup_method(self):
+        admin_auth._failed_login_attempts.clear()
+
+    def teardown_method(self):
+        admin_auth._failed_login_attempts.clear()
+
+    def test_allows_attempts_below_limit(self):
+        for _ in range(admin_auth.LOGIN_ATTEMPT_LIMIT - 1):
+            admin_auth.record_failed_login("1.2.3.4")
+            admin_auth.check_login_rate_limit("1.2.3.4")  # should not raise
+
+    def test_blocks_once_limit_reached(self):
+        for _ in range(admin_auth.LOGIN_ATTEMPT_LIMIT):
+            admin_auth.record_failed_login("1.2.3.5")
+        with pytest.raises(HTTPException) as exc_info:
+            admin_auth.check_login_rate_limit("1.2.3.5")
+        assert exc_info.value.status_code == 429
+
+    def test_different_clients_tracked_independently(self):
+        for _ in range(admin_auth.LOGIN_ATTEMPT_LIMIT):
+            admin_auth.record_failed_login("1.2.3.6")
+        admin_auth.check_login_rate_limit("1.2.3.7")  # different IP, should not raise
+
+    def test_clear_login_attempts_resets_lockout(self):
+        for _ in range(admin_auth.LOGIN_ATTEMPT_LIMIT):
+            admin_auth.record_failed_login("1.2.3.8")
+        admin_auth.clear_login_attempts("1.2.3.8")
+        admin_auth.check_login_rate_limit("1.2.3.8")  # should not raise
+
+    def test_old_attempts_outside_window_are_dropped(self):
+        stale = time.monotonic() - admin_auth.LOGIN_ATTEMPT_WINDOW_SECONDS - 1
+        admin_auth._failed_login_attempts["1.2.3.9"] = [stale] * admin_auth.LOGIN_ATTEMPT_LIMIT
+        admin_auth.check_login_rate_limit("1.2.3.9")  # should not raise; all stale
+
+    @pytest.mark.asyncio
+    async def test_login_endpoint_returns_429_after_repeated_failures(self):
+        mock_settings = MagicMock()
+        mock_settings.auth.api_key = "correct-key"
+        original = admin_routes._get_global_settings
+        admin_routes._get_global_settings = lambda: mock_settings
+        http_request = MagicMock()
+        http_request.client.host = "9.9.9.9"
+        try:
+            request = admin_routes.LoginRequest(api_key="wrong-key")
+            for _ in range(admin_auth.LOGIN_ATTEMPT_LIMIT):
+                with pytest.raises(HTTPException) as exc_info:
+                    await admin_routes.login(request, http_request, MagicMock())
+                assert exc_info.value.status_code == 401
+
+            with pytest.raises(HTTPException) as exc_info:
+                await admin_routes.login(request, http_request, MagicMock())
+            assert exc_info.value.status_code == 429
+        finally:
+            admin_routes._get_global_settings = original

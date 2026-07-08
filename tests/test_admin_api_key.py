@@ -334,7 +334,11 @@ class TestLoginRejectsSubKey:
         try:
             request = admin_routes.LoginRequest(api_key="sub-key-1")
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.login(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.login(
+                        request, _mock_http_request("10.0.0.1"), MagicMock()
+                    )
+                )
             assert exc_info.value.status_code == 401
         finally:
             _restore_getter(original)
@@ -351,7 +355,11 @@ class TestLoginRejectsSubKey:
         original = _patch_getter(mock_settings)
         try:
             request = admin_routes.LoginRequest(api_key="main-key")
-            result = asyncio.run(admin_routes.login(request, mock_response))
+            result = asyncio.run(
+                admin_routes.login(
+                    request, _mock_http_request("10.0.0.2"), mock_response
+                )
+            )
             assert result["success"] is True
         finally:
             _restore_getter(original)
@@ -510,6 +518,13 @@ def _mock_global_settings(api_key=None):
     return mock
 
 
+def _mock_http_request(ip="127.0.0.1"):
+    """Create a mock Request with a given client IP for login rate-limit tests."""
+    req = MagicMock()
+    req.client.host = ip
+    return req
+
+
 def _patch_getter(mock_settings):
     """Replace the module-level _get_global_settings with a lambda returning mock."""
     original = admin_routes._get_global_settings
@@ -633,7 +648,11 @@ class TestLoginEndpoint:
         try:
             request = admin_routes.LoginRequest(api_key="anykey")
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.login(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.login(
+                        request, _mock_http_request("10.0.0.3"), MagicMock()
+                    )
+                )
             assert exc_info.value.status_code == 400
             assert "No API key configured" in exc_info.value.detail
         finally:
@@ -648,7 +667,11 @@ class TestLoginEndpoint:
         try:
             request = admin_routes.LoginRequest(api_key="wrong-key")
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.login(request, MagicMock()))
+                asyncio.run(
+                    admin_routes.login(
+                        request, _mock_http_request("10.0.0.4"), MagicMock()
+                    )
+                )
             assert exc_info.value.status_code == 401
         finally:
             _restore_getter(original)
@@ -660,7 +683,11 @@ class TestLoginEndpoint:
         original = _patch_getter(mock_settings)
         try:
             request = admin_routes.LoginRequest(api_key="correct-key")
-            result = asyncio.run(admin_routes.login(request, mock_response))
+            result = asyncio.run(
+                admin_routes.login(
+                    request, _mock_http_request("10.0.0.5"), mock_response
+                )
+            )
             assert result["success"] is True
             mock_response.set_cookie.assert_called_once()
         finally:

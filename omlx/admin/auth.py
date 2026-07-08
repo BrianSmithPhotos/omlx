@@ -8,6 +8,8 @@ and API key verification for admin panel access.
 import hashlib
 import os
 import secrets
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -299,3 +301,57 @@ async def require_admin(request: Request) -> bool:
 class _RedirectToLogin(Exception):
     """Raised to trigger a redirect to the admin login page."""
     pass
+
+
+# =============================================================================
+# Login brute-force lockout
+# =============================================================================
+#
+# The admin login endpoint accepts an API key with no attempt limit
+# (jundot/omlx#925), so a network-reachable server could be brute-forced.
+# This is an in-process, per-client-IP counter: simple and dependency-free,
+# appropriate for the single-process local server this runs as.
+
+LOGIN_ATTEMPT_LIMIT = 10
+LOGIN_ATTEMPT_WINDOW_SECONDS = 300  # 5 minutes
+
+_login_attempts_lock = threading.Lock()
+_failed_login_attempts: dict[str, list[float]] = {}
+
+
+def check_login_rate_limit(client_key: str) -> None:
+    """Raise HTTPException(429) if client_key has too many recent failures.
+
+    Args:
+        client_key: Identifier for the caller, typically their IP address.
+
+    Raises:
+        HTTPException: 429 if the failure count within the window has
+            reached LOGIN_ATTEMPT_LIMIT.
+    """
+    now = time.monotonic()
+    with _login_attempts_lock:
+        attempts = [
+            t
+            for t in _failed_login_attempts.get(client_key, [])
+            if now - t < LOGIN_ATTEMPT_WINDOW_SECONDS
+        ]
+        _failed_login_attempts[client_key] = attempts
+        if len(attempts) >= LOGIN_ATTEMPT_LIMIT:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed login attempts. Please try again later.",
+            )
+
+
+def record_failed_login(client_key: str) -> None:
+    """Record a failed login attempt for client_key."""
+    now = time.monotonic()
+    with _login_attempts_lock:
+        _failed_login_attempts.setdefault(client_key, []).append(now)
+
+
+def clear_login_attempts(client_key: str) -> None:
+    """Clear recorded failures for client_key, e.g. after a successful login."""
+    with _login_attempts_lock:
+        _failed_login_attempts.pop(client_key, None)
