@@ -8,11 +8,12 @@ and API key verification for admin panel access.
 import hashlib
 import os
 import secrets
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import HTTPException, Request
 from fastapi.responses import RedirectResponse
-from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from itsdangerous import BadSignature, URLSafeTimedSerializer
 
 # Session configuration
 SESSION_COOKIE_NAME = "omlx_admin_session"
@@ -93,21 +94,22 @@ def verify_session_token(token: str, max_age: int = SESSION_MAX_AGE) -> bool:
         False
     """
     try:
-        # First load without max_age check to read the remember flag
-        data = _serializer.loads(token, max_age=None)
-        if data.get("admin", False) is not True:
-            return False
-
-        # Determine the appropriate max_age based on remember flag
-        effective_max_age = (
-            REMEMBER_ME_MAX_AGE if data.get("remember", False) else max_age
-        )
-
-        # Re-validate with the correct max_age
-        data = _serializer.loads(token, max_age=effective_max_age)
-        return data.get("admin", False) is True
-    except (BadSignature, SignatureExpired):
+        # Single decode: itsdangerous only verifies the signature here
+        # since max_age=None, so we get the payload and issue timestamp
+        # to apply our own remember-flag-dependent expiry against below.
+        data, issued_at = _serializer.loads(token, max_age=None, return_timestamp=True)
+    except BadSignature:
         return False
+
+    if data.get("admin", False) is not True:
+        return False
+
+    # Determine the appropriate max_age based on remember flag
+    effective_max_age = (
+        REMEMBER_ME_MAX_AGE if data.get("remember", False) else max_age
+    )
+    age = (datetime.now(timezone.utc) - issued_at).total_seconds()
+    return age <= effective_max_age
 
 
 def compare_keys(provided_key: str, expected_key: str) -> bool:
