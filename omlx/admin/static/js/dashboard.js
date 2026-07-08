@@ -153,7 +153,6 @@
             showNewSubKeyForm: false,
             showNewSubKey: false,
             subKeyError: '',
-            showSubKeys: {},
 
             // Saving state
             saving: false,
@@ -973,13 +972,13 @@
                 }
             },
 
-            async deleteSubKey(key) {
+            async deleteSubKey(id) {
                 if (!confirm(window.t('settings.auth.sub_keys_delete_confirm'))) return;
                 try {
                     const response = await fetch('/admin/api/sub-keys', {
                         method: 'DELETE',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ key }),
+                        body: JSON.stringify({ id }),
                     });
                     if (response.ok) {
                         await this.loadGlobalSettings();

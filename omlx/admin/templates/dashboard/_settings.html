@@ -174,22 +174,18 @@
 
                                     <!-- Existing Sub Keys List -->
                                     <div class="space-y-2">
-                                        <template x-for="sk in globalSettings.auth.sub_keys" :key="sk.key">
+                                        <template x-for="sk in globalSettings.auth.sub_keys" :key="sk.id">
                                             <div class="flex items-center justify-between p-3 bg-neutral-50 rounded-xl border border-neutral-100">
                                                 <div class="flex-1 min-w-0">
                                                     <div class="flex items-center gap-2">
                                                         <span class="text-sm font-medium text-neutral-700" x-text="sk.name || '{{ t('settings.auth.sub_keys_unnamed') }}'"></span>
                                                     </div>
                                                     <div class="flex items-center gap-2 mt-1">
-                                                        <code class="text-xs text-neutral-400 font-mono" x-text="showSubKeys[sk.key] ? sk.key : sk.key.substring(0, 4) + '••••••••'"></code>
-                                                        <button type="button" @click="showSubKeys[sk.key] = !showSubKeys[sk.key]"
-                                                                class="text-neutral-400 hover:text-neutral-600 transition-colors">
-                                                            <svg class="w-3.5 h-3.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"/><circle cx="12" cy="12" r="3"/></svg>
-                                                        </button>
+                                                        <code class="text-xs text-neutral-400 font-mono" x-text="sk.key"></code>
                                                     </div>
                                                     <div class="text-[10px] text-neutral-400 mt-1" x-text="sk.created_at ? new Date(sk.created_at).toLocaleDateString() : ''"></div>
                                                 </div>
-                                                <button type="button" @click="deleteSubKey(sk.key)"
+                                                <button type="button" @click="deleteSubKey(sk.id)"
                                                         class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors ml-2"
                                                         title="{{ t('settings.auth.sub_keys_delete') }}">
                                                     <svg class="w-4 h-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>

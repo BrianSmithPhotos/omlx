@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import shutil
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -448,11 +449,28 @@ class SubKeyEntry:
     key: str
     name: str = ""
     created_at: str = ""
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
+            "id": self.id,
             "key": self.key,
+            "name": self.name,
+            "created_at": self.created_at,
+        }
+
+    def to_masked_dict(self) -> dict[str, Any]:
+        """Convert to dictionary with the key value redacted.
+
+        Used for responses to already-authenticated admin sessions: the
+        dashboard only needs the last 4 characters to let a user recognize
+        which key is which, not the full secret.
+        """
+        masked = self.key[-4:] if len(self.key) > 4 else self.key
+        return {
+            "id": self.id,
+            "key": f"{'*' * 8}{masked}",
             "name": self.name,
             "created_at": self.created_at,
         }
@@ -464,6 +482,7 @@ class SubKeyEntry:
             key=data.get("key", ""),
             name=data.get("name", ""),
             created_at=data.get("created_at", ""),
+            id=data.get("id") or uuid.uuid4().hex,
         )
 
 

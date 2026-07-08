@@ -430,10 +430,12 @@ class TestSubKeyCRUD:
         from omlx.settings import SubKeyEntry
 
         mock_settings = _mock_global_settings(api_key="main-key")
-        mock_settings.auth.sub_keys = [SubKeyEntry(key="sub-to-delete", name="Test")]
+        mock_settings.auth.sub_keys = [
+            SubKeyEntry(key="sub-to-delete", name="Test", id="sk-1")
+        ]
         original = _patch_getter(mock_settings)
         try:
-            request = admin_routes.DeleteSubKeyRequest(key="sub-to-delete")
+            request = admin_routes.DeleteSubKeyRequest(id="sk-1")
             result = asyncio.run(admin_routes.delete_sub_key(request, is_admin=True))
             assert result["success"] is True
             assert len(mock_settings.auth.sub_keys) == 0
@@ -449,7 +451,7 @@ class TestSubKeyCRUD:
         mock_settings.auth.sub_keys = []
         original = _patch_getter(mock_settings)
         try:
-            request = admin_routes.DeleteSubKeyRequest(key="nonexistent")
+            request = admin_routes.DeleteSubKeyRequest(id="nonexistent")
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(admin_routes.delete_sub_key(request, is_admin=True))
             assert exc_info.value.status_code == 404
@@ -457,11 +459,11 @@ class TestSubKeyCRUD:
             _restore_getter(original)
 
     def test_delete_sub_key_lone_surrogate_returns_404(self):
-        """Regression for #1717: a lone-surrogate key must 404, not 500.
+        """A lone-surrogate id must 404, not error.
 
-        delete_sub_key compares request.key without a validate_api_key
-        gate, so the comparison itself must tolerate any str json.loads
-        can produce, including lone surrogates from escape sequences.
+        delete_sub_key matches request.id with plain string equality, so
+        it must tolerate any str json.loads can produce, including lone
+        surrogates from escape sequences, without raising.
         """
         import json
 
@@ -469,10 +471,12 @@ class TestSubKeyCRUD:
         from omlx.settings import SubKeyEntry
 
         mock_settings = _mock_global_settings(api_key="main-key")
-        mock_settings.auth.sub_keys = [SubKeyEntry(key="real-sub-key")]
+        mock_settings.auth.sub_keys = [
+            SubKeyEntry(key="real-sub-key", id="sk-1")
+        ]
         original = _patch_getter(mock_settings)
         try:
-            request = admin_routes.DeleteSubKeyRequest(key=json.loads('"\\ud800abcd"'))
+            request = admin_routes.DeleteSubKeyRequest(id=json.loads('"\\ud800abcd"'))
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(admin_routes.delete_sub_key(request, is_admin=True))
             assert exc_info.value.status_code == 404

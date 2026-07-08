@@ -79,7 +79,7 @@ class CreateSubKeyRequest(BaseModel):
 class DeleteSubKeyRequest(BaseModel):
     """Request model for deleting a sub API key."""
 
-    key: str
+    id: str
 
 
 class CacheProbeRequest(BaseModel):
@@ -1677,7 +1677,7 @@ async def delete_sub_key(
     """Delete a sub API key.
 
     Args:
-        request: DeleteSubKeyRequest with the key to delete.
+        request: DeleteSubKeyRequest with the id of the key to delete.
 
     Returns:
         JSON with success status.
@@ -1689,9 +1689,10 @@ async def delete_sub_key(
     if global_settings is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
 
-    # Find and remove the key
+    # Find and remove the key by id (the GET response only exposes a
+    # masked key value, so deletion can't match on the raw key anymore)
     for i, sk in enumerate(global_settings.auth.sub_keys):
-        if sk.key and compare_keys(request.key, sk.key):
+        if sk.id == request.id:
             removed = global_settings.auth.sub_keys.pop(i)
             try:
                 global_settings.save()
@@ -3260,9 +3261,13 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         },
         "auth": {
             "api_key_set": bool(global_settings.auth.api_key),
+            # The main key is intentionally not masked here: the settings
+            # form round-trips this field on every save (dashboard.js), so
+            # masking it would overwrite the real key with the mask on the
+            # next unrelated save and lock the admin out of their own panel.
             "api_key": global_settings.auth.api_key or "",
             "skip_api_key_verification": global_settings.auth.skip_api_key_verification,
-            "sub_keys": [sk.to_dict() for sk in global_settings.auth.sub_keys],
+            "sub_keys": [sk.to_masked_dict() for sk in global_settings.auth.sub_keys],
         },
         "claude_code": {
             "context_scaling_enabled": global_settings.claude_code.context_scaling_enabled,
