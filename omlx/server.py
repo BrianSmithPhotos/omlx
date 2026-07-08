@@ -753,6 +753,44 @@ async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
     return JSONResponse(status_code=500, content=content)
 
 
+_SENSITIVE_BODY_KEYS = frozenset(
+    {
+        "api_key",
+        "api_key_confirm",
+        "key",
+        "password",
+        "token",
+        "secret",
+        "secret_key",
+        "access_token",
+        "authorization",
+        "client_secret",
+    }
+)
+
+
+def _redact_sensitive_json(value):
+    """Recursively replace known-sensitive keys in a parsed JSON body.
+
+    TRACE-level request logging dumps the raw body verbatim, which would
+    otherwise include plaintext API keys/passwords from bodies like
+    admin login or sub-key creation. Only known sensitive field names are
+    redacted so the rest of the body (e.g. chat messages) still logs.
+    """
+    if isinstance(value, dict):
+        return {
+            k: (
+                "***REDACTED***"
+                if k.lower() in _SENSITIVE_BODY_KEYS
+                else _redact_sensitive_json(v)
+            )
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive_json(v) for v in value]
+    return value
+
+
 class DebugRequestLoggingMiddleware:
     """Pure ASGI middleware for trace-level request body logging.
 
@@ -782,12 +820,19 @@ class DebugRequestLoggingMiddleware:
                 break
 
         body = b"".join(part.get("body", b"") for part in body_parts)
+        raw_text = body.decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError:
+            logged_body = raw_text
+        else:
+            logged_body = json.dumps(_redact_sensitive_json(parsed))
         logger.log(
             5,
             "Incoming %s %s — body: %s",
             scope["method"],
             scope["path"],
-            body.decode("utf-8", errors="replace"),
+            logged_body,
         )
 
         # Replay cached body for inner app, then forward real receive
