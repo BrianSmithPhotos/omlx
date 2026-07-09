@@ -258,6 +258,24 @@ def verify_session(request: Request) -> bool:
     return verify_session_token(token)
 
 
+def request_is_https(request: Request) -> bool:
+    """Best-effort check for whether this request arrived over HTTPS.
+
+    Used to decide the session cookie's Secure flag. Forcing Secure
+    unconditionally breaks the common case of a plain-HTTP local admin
+    panel (jundot/omlx#927 was dismissed for exactly that reason), so
+    the flag should only be set when the connection is actually TLS —
+    including behind a reverse proxy that terminates TLS and forwards
+    the original scheme via X-Forwarded-Proto. A client spoofing that
+    header can only make the server set Secure when it shouldn't
+    (self-inflicted cookie loss over their own plain-HTTP connection),
+    never the reverse, so trusting it here doesn't weaken anything.
+    """
+    if request.url.scheme == "https":
+        return True
+    return request.headers.get("x-forwarded-proto", "").lower() == "https"
+
+
 async def require_admin(request: Request) -> bool:
     """FastAPI dependency to require admin authentication.
 

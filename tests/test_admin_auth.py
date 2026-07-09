@@ -34,6 +34,15 @@ def _restore_getter(original):
     admin_routes._get_global_settings = original
 
 
+def _mock_http_request(ip="127.0.0.1", scheme="http"):
+    """Create a mock Request with a given client IP and scheme."""
+    req = MagicMock()
+    req.client.host = ip
+    req.url.scheme = scheme
+    req.headers.get.return_value = ""
+    return req
+
+
 class TestAutoLogin:
     """Tests for GET /admin/auto-login endpoint."""
 
@@ -43,7 +52,7 @@ class TestAutoLogin:
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="test-key", redirect="/admin/dashboard")
+                admin_routes.auto_login(http_request=_mock_http_request(), key="test-key", redirect="/admin/dashboard")
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin/dashboard"
@@ -59,7 +68,7 @@ class TestAutoLogin:
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="test-key", redirect="/admin/chat")
+                admin_routes.auto_login(http_request=_mock_http_request(), key="test-key", redirect="/admin/chat")
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin/chat"
@@ -72,7 +81,7 @@ class TestAutoLogin:
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="wrong-key", redirect="/admin/dashboard")
+                admin_routes.auto_login(http_request=_mock_http_request(), key="wrong-key", redirect="/admin/dashboard")
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin"
@@ -87,7 +96,7 @@ class TestAutoLogin:
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="", redirect="/admin/dashboard")
+                admin_routes.auto_login(http_request=_mock_http_request(), key="", redirect="/admin/dashboard")
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin"
@@ -100,7 +109,7 @@ class TestAutoLogin:
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="any-key", redirect="/admin/dashboard")
+                admin_routes.auto_login(http_request=_mock_http_request(), key="any-key", redirect="/admin/dashboard")
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin"
@@ -115,7 +124,7 @@ class TestAutoLogin:
             with pytest.raises(HTTPException) as exc_info:
                 asyncio.run(
                     admin_routes.auto_login(
-                        key="test-key", redirect="https://evil.com"
+                        http_request=_mock_http_request(), key="test-key", redirect="https://evil.com"
                     )
                 )
             assert exc_info.value.status_code == 400
@@ -129,7 +138,7 @@ class TestAutoLogin:
         original = _patch_getter(mock_settings)
         try:
             result = asyncio.run(
-                admin_routes.auto_login(key="test-key", redirect="/admin")
+                admin_routes.auto_login(http_request=_mock_http_request(), key="test-key", redirect="/admin")
             )
             assert result.status_code == 302
             assert result.headers["location"] == "/admin"
@@ -552,3 +561,53 @@ class TestLoginRateLimit:
             assert exc_info.value.status_code == 429
         finally:
             admin_routes._get_global_settings = original
+
+
+class TestSessionCookieSecureFlag:
+    """Tests for conditional Secure cookie flag (jundot/omlx#927)."""
+
+    def test_request_is_https_plain_http(self):
+        req = _mock_http_request(scheme="http")
+        assert admin_auth.request_is_https(req) is False
+
+    def test_request_is_https_direct_tls(self):
+        req = _mock_http_request(scheme="https")
+        assert admin_auth.request_is_https(req) is True
+
+    def test_request_is_https_behind_proxy_header(self):
+        req = _mock_http_request(scheme="http")
+        req.headers.get.return_value = "https"
+        assert admin_auth.request_is_https(req) is True
+
+    def test_request_is_https_proxy_header_case_insensitive(self):
+        req = _mock_http_request(scheme="http")
+        req.headers.get.return_value = "HTTPS"
+        assert admin_auth.request_is_https(req) is True
+
+    @pytest.mark.asyncio
+    async def test_login_cookie_not_secure_over_http(self):
+        mock_settings = _mock_global_settings(api_key="main-key")
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.LoginRequest(api_key="main-key")
+            mock_response = MagicMock()
+            await admin_routes.login(
+                request, _mock_http_request(scheme="http"), mock_response
+            )
+            assert mock_response.set_cookie.call_args.kwargs["secure"] is False
+        finally:
+            _restore_getter(original)
+
+    @pytest.mark.asyncio
+    async def test_login_cookie_secure_over_https(self):
+        mock_settings = _mock_global_settings(api_key="main-key")
+        original = _patch_getter(mock_settings)
+        try:
+            request = admin_routes.LoginRequest(api_key="main-key")
+            mock_response = MagicMock()
+            await admin_routes.login(
+                request, _mock_http_request(scheme="https"), mock_response
+            )
+            assert mock_response.set_cookie.call_args.kwargs["secure"] is True
+        finally:
+            _restore_getter(original)

@@ -42,6 +42,7 @@ from .auth import (
     compare_keys,
     create_session_token,
     record_failed_login,
+    request_is_https,
     require_admin,
     validate_api_key,
     verify_api_key,
@@ -1497,6 +1498,7 @@ async def login(request: LoginRequest, http_request: Request, response: Response
         value=token,
         httponly=True,
         samesite="lax",
+        secure=request_is_https(http_request),
         max_age=cookie_max_age,
     )
 
@@ -1504,7 +1506,9 @@ async def login(request: LoginRequest, http_request: Request, response: Response
 
 
 @router.post("/api/setup-api-key")
-async def setup_api_key(request: SetupApiKeyRequest, response: Response):
+async def setup_api_key(
+    request: SetupApiKeyRequest, http_request: Request, response: Response
+):
     """
     Set up the initial API key when none is configured.
 
@@ -1514,6 +1518,7 @@ async def setup_api_key(request: SetupApiKeyRequest, response: Response):
 
     Args:
         request: SetupApiKeyRequest with api_key and api_key_confirm.
+        http_request: FastAPI Request, used to detect HTTPS for the cookie.
         response: FastAPI response object for setting cookies.
 
     Returns:
@@ -1562,6 +1567,7 @@ async def setup_api_key(request: SetupApiKeyRequest, response: Response):
         value=token,
         httponly=True,
         samesite="lax",
+        secure=request_is_https(http_request),
         max_age=86400,  # 24 hours
     )
 
@@ -1584,7 +1590,9 @@ async def logout(response: Response):
 
 
 @router.get("/auto-login")
-async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
+async def auto_login(
+    http_request: Request, key: str = "", redirect: str = "/admin/dashboard"
+):
     """
     Auto-login using API key and redirect to the target admin page.
 
@@ -1592,6 +1600,7 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
     authentication, bypassing the manual login form.
 
     Args:
+        http_request: FastAPI Request, used to detect HTTPS for the cookie.
         key: The API key for authentication.
         redirect: The path to redirect to after login. Must start with /admin.
 
@@ -1615,6 +1624,7 @@ async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
         value=token,
         httponly=True,
         samesite="lax",
+        secure=request_is_https(http_request),
         max_age=86400,
     )
     return response

@@ -551,7 +551,7 @@ class TestSetupApiKeyEndpoint:
                 api_key="newkey", api_key_confirm="newkey"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(admin_routes.setup_api_key(request, _mock_http_request(), MagicMock()))
             assert exc_info.value.status_code == 400
             assert "already configured" in exc_info.value.detail
         finally:
@@ -568,7 +568,7 @@ class TestSetupApiKeyEndpoint:
                 api_key="key1", api_key_confirm="key2"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(admin_routes.setup_api_key(request, _mock_http_request(), MagicMock()))
             assert exc_info.value.status_code == 400
             assert "do not match" in exc_info.value.detail
         finally:
@@ -585,7 +585,7 @@ class TestSetupApiKeyEndpoint:
                 api_key="abc", api_key_confirm="abc"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(admin_routes.setup_api_key(request, _mock_http_request(), MagicMock()))
             assert exc_info.value.status_code == 400
             assert "at least 4" in exc_info.value.detail
         finally:
@@ -602,7 +602,7 @@ class TestSetupApiKeyEndpoint:
                 api_key="ab cd", api_key_confirm="ab cd"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(admin_routes.setup_api_key(request, _mock_http_request(), MagicMock()))
             assert exc_info.value.status_code == 400
             assert "whitespace" in exc_info.value.detail
         finally:
@@ -624,7 +624,7 @@ class TestSetupApiKeyEndpoint:
                     api_key="validkey123", api_key_confirm="validkey123"
                 )
                 result = asyncio.run(
-                    admin_routes.setup_api_key(request, mock_response)
+                    admin_routes.setup_api_key(request, _mock_http_request(), mock_response)
                 )
 
                 assert result["success"] is True
