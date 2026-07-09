@@ -44,6 +44,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -198,6 +199,38 @@ logger = logging.getLogger(__name__)
 
 # Security bearer for API key authentication
 security = HTTPBearer(auto_error=False)
+
+# Origins allowed by CORS when cors_origins is left at its default ["*"]
+# (jundot/omlx#928). A bare wildcard lets any website's JS read responses
+# from a locally-reachable oMLX instance via fetch(), including responses
+# containing an Authorization-bearing request's output. Restricting the
+# default to loopback and private-network (RFC 1918 / link-local) origins
+# keeps same-machine and same-LAN browser clients working while stopping
+# an arbitrary public website from talking to the server in the background.
+# Any cors_origins value other than the untouched default is honored as-is,
+# since that's an explicit choice by whoever configured the server.
+_PRIVATE_NETWORK_ORIGIN_REGEX = re.compile(
+    r"^https?://("
+    r"localhost"
+    r"|127\.0\.0\.1"
+    r"|\[::1\]"
+    r"|10\.\d{1,3}\.\d{1,3}\.\d{1,3}"
+    r"|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
+    r"|192\.168\.\d{1,3}\.\d{1,3}"
+    r"|169\.254\.\d{1,3}\.\d{1,3}"
+    r")(:\d+)?$"
+)
+
+
+def _cors_allow_origin_kwargs(cors_origins: list[str]) -> dict[str, object]:
+    """Return the allow_origin* kwarg for CORSMiddleware given a settings value.
+
+    An unmodified default of ["*"] is restricted to loopback/private-network
+    origins (jundot/omlx#928); any other explicit value is honored as-is.
+    """
+    if cors_origins == ["*"]:
+        return {"allow_origin_regex": _PRIVATE_NETWORK_ORIGIN_REGEX.pattern}
+    return {"allow_origins": cors_origins}
 
 
 # =============================================================================
@@ -1713,12 +1746,15 @@ def init_server(
     cors_origins = global_settings.server.cors_origins if global_settings else ["*"]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=cors_origins,
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
+        **_cors_allow_origin_kwargs(cors_origins),
     )
-    logger.info(f"CORS origins: {cors_origins}")
+    if cors_origins == ["*"]:
+        logger.info("CORS origins: default (loopback/private-network only)")
+    else:
+        logger.info(f"CORS origins: {cors_origins}")
 
     # Initialize model settings manager
     base_path = (

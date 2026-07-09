@@ -2197,8 +2197,13 @@ class TestClaudeCodeRouteIntegration:
 class TestCORSMiddleware:
     """Test that CORS middleware is correctly applied to the server."""
 
-    def test_cors_preflight(self):
-        """Test that CORS preflight requests get proper response headers."""
+    def test_cors_preflight_allows_private_network_origin_by_default(self):
+        """Default cors_origins (["*"]) allows loopback/private-network origins.
+
+        jundot/omlx#928: the default used to be a bare wildcard, which let
+        any public website's JS talk to a locally-reachable server. The
+        default now resolves to loopback/private-network origins only.
+        """
         from fastapi.testclient import TestClient
 
         from omlx.server import app, init_server
@@ -2218,10 +2223,68 @@ class TestCORSMiddleware:
             resp = client.options(
                 "/v1/models",
                 headers={
+                    "Origin": "http://127.0.0.1:3000",
+                    "Access-Control-Request-Method": "GET",
+                },
+            )
+            assert resp.status_code == 200
+            assert (
+                resp.headers.get("access-control-allow-origin")
+                == "http://127.0.0.1:3000"
+            )
+
+    def test_cors_preflight_rejects_public_origin_by_default(self):
+        """Default cors_origins (["*"]) rejects arbitrary public origins."""
+        from fastapi.testclient import TestClient
+
+        from omlx.server import app, init_server
+
+        app.middleware_stack = None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings(base_path=Path(tmpdir))
+            init_server(
+                model_dirs=[tmpdir],
+                global_settings=settings,
+            )
+
+            client = TestClient(app)
+            resp = client.options(
+                "/v1/models",
+                headers={
+                    "Origin": "https://example.com",
+                    "Access-Control-Request-Method": "GET",
+                },
+            )
+            assert resp.status_code == 400
+            assert "access-control-allow-origin" not in resp.headers
+
+    def test_cors_preflight_honors_explicit_origins(self):
+        """An explicitly configured cors_origins list is honored as-is."""
+        from fastapi.testclient import TestClient
+
+        from omlx.server import app, init_server
+
+        app.middleware_stack = None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = GlobalSettings(base_path=Path(tmpdir))
+            settings.server.cors_origins = ["https://example.com"]
+            init_server(
+                model_dirs=[tmpdir],
+                global_settings=settings,
+            )
+
+            client = TestClient(app)
+            resp = client.options(
+                "/v1/models",
+                headers={
                     "Origin": "https://example.com",
                     "Access-Control-Request-Method": "GET",
                 },
             )
             assert resp.status_code == 200
-            assert "access-control-allow-origin" in resp.headers
-            assert resp.headers["access-control-allow-origin"] == "*"
+            assert (
+                resp.headers.get("access-control-allow-origin")
+                == "https://example.com"
+            )
