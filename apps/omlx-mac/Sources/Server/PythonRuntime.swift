@@ -7,6 +7,15 @@
 //      Layout matches the venvstacks export tree, which
 //      apps/omlx-mac/Scripts/build.sh copies verbatim into the Swift .app.
 //   3. Legacy bundle layouts under Contents/Python or Contents/Frameworks.
+//   4. <repo>/.venv/bin/python3 — dev checkout fallback. Only reachable when
+//      running an unbundled Xcode build (⌘R) straight from a git checkout,
+//      where steps 2/3 never find an embedded Python. Located via
+//      `#filePath`, which bakes in the *build-machine* source path — on a
+//      real installed/notarized bundle that path doesn't exist on disk, so
+//      this step is a cheap, harmless no-op there. `.venv` itself is
+//      whatever `uv sync` produced; we don't invoke uv here (a blocking
+//      subprocess on the app-launch path is worse than a clear error), so
+//      the venv must already exist.
 //
 // In the bundled case the spawn environment also sets:
 //   PYTHONHOME = Contents/Resources/Python/cpython-3.11
@@ -94,7 +103,47 @@ struct PythonRuntime {
             )
         }
 
+        if let devRuntime = devCheckoutRuntime(tried: &tried) {
+            return devRuntime
+        }
+
         throw ResolutionError.notFound(triedPaths: tried)
+    }
+
+    /// `<repo>/.venv/bin/python3`, located via the build-time path of this
+    /// source file. Returns nil (and records what was tried) rather than
+    /// throwing — this is one candidate among several, not a hard failure.
+    private static func devCheckoutRuntime(tried: inout [String]) -> PythonRuntime? {
+        // Sources/Server/PythonRuntime.swift -> repo root is 5 levels up
+        // (Server, Sources, omlx-mac, apps, then the repo root itself).
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+
+        guard FileManager.default.fileExists(
+            atPath: repoRoot.appendingPathComponent("pyproject.toml").path
+        ) else {
+            // Not sitting in a live checkout (e.g. this path doesn't exist
+            // at all on an installed/notarized bundle's host machine).
+            return nil
+        }
+
+        let venvPython = repoRoot.appendingPathComponent(".venv/bin/python3")
+        tried.append("\(venvPython.path) (run `uv sync` in \(repoRoot.path) to create it)")
+        guard FileManager.default.isExecutableFile(atPath: venvPython.path) else {
+            return nil
+        }
+
+        return PythonRuntime(
+            executable: venvPython,
+            homebrewPaths: defaultHomebrewPaths,
+            pythonPath: [],
+            pythonHome: nil,
+            isBundled: false
+        )
     }
 
     /// Build the spawn environment: parent env + supervisor marker +
