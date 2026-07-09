@@ -798,6 +798,8 @@ _SENSITIVE_BODY_KEYS = frozenset(
         "access_token",
         "authorization",
         "client_secret",
+        "hf_token",
+        "ms_token",
     }
 )
 

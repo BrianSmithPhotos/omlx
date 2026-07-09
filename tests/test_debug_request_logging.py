@@ -33,6 +33,20 @@ class TestRedactSensitiveJson:
         data = {"messages": [{"role": "user", "content": "hello"}]}
         assert _redact_sensitive_json(data) == data
 
+    def test_redacts_hf_and_ms_tokens(self):
+        data = {"hf_token": "hf_abc123", "ms_token": "ms_xyz789", "repo_id": "org/model"}
+        assert _redact_sensitive_json(data) == {
+            "hf_token": "***REDACTED***",
+            "ms_token": "***REDACTED***",
+            "repo_id": "org/model",
+        }
+
+    def test_max_tokens_not_redacted(self):
+        # max_tokens/budget_tokens etc. are token *counts*, not credentials —
+        # the exact-match redaction list must not treat "token" as a substring.
+        data = {"max_tokens": 512, "budget_tokens": 128}
+        assert _redact_sensitive_json(data) == data
+
 
 class TestDebugRequestLoggingMiddleware:
     def _run(self, body: bytes, *, method="POST", enabled=True):
