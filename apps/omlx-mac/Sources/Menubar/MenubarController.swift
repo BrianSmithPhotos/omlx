@@ -710,8 +710,20 @@ final class MenubarController: NSObject {
         guard serverIsRunning else { return }
         let host = MenubarController.displayHost(server: server, fallback: config.host)
         let port = MenubarController.displayPort(server: server, fallback: config.port)
-        guard let url = MenubarController.webAdminURL(host: host, port: port, apiKey: config.apiKey) else { return }
-        NSWorkspace.shared.open(url)
+        let apiKey = config.apiKey
+        // The API key must never travel in a URL (jundot/omlx#924): exchange
+        // it for a short-lived one-time token over POST first, then embed
+        // only the token in the browser URL.
+        Task { @MainActor in
+            var token: String?
+            if let apiKey, !apiKey.isEmpty {
+                token = try? await MenubarController.fetchAutoLoginToken(
+                    host: host, port: port, apiKey: apiKey
+                )
+            }
+            guard let url = MenubarController.webAdminURL(host: host, port: port, token: token) else { return }
+            NSWorkspace.shared.open(url)
+        }
     }
 
     @objc private func openChat() {
@@ -822,20 +834,26 @@ extension MenubarController {
 
     /// Builds the browser URL for the web admin dashboard. Uses the
     /// `/admin/auto-login` endpoint so the dashboard opens without the
-    /// manual login form: the server validates the main API key, sets the
-    /// session cookie, then redirects to `redirect`. A missing/stale key
+    /// manual login form: the server validates `token`, sets the session
+    /// cookie, then redirects to `redirect`. A missing/stale/expired token
     /// makes the endpoint redirect to the login page instead — a graceful
     /// fallback, so we still emit the URL.
     ///
-    /// `URLComponents.queryItems` percent-encodes the key, so a key
+    /// `token` is a short-lived, single-use value from
+    /// `fetchAutoLoginToken(host:port:apiKey:)`, never the raw API key
+    /// (jundot/omlx#924) — the key must never appear in a URL, since URLs
+    /// are written verbatim to access logs, browser history, and Referer
+    /// headers.
+    ///
+    /// `URLComponents.queryItems` percent-encodes the token, so a value
     /// containing `&`, `=`, `/`, spaces etc. is transmitted intact. The one
     /// exception is `+`: URLComponents leaves it unescaped and servers
     /// decode `+` as a space (form-urlencoded semantics), which would
-    /// corrupt a key containing `+`. We escape it explicitly below.
+    /// corrupt a token containing `+`. We escape it explicitly below.
     ///
     /// Internal (not private) so `MenubarControllerPortTests` can exercise
     /// it without a live `NSStatusBar`.
-    static func webAdminURL(host: String, port: Int, apiKey: String?) -> URL? {
+    static func webAdminURL(host: String, port: Int, token: String?) -> URL? {
         guard let baseURL = AppConfig.httpURL(
             host: AppConfig.connectableHost(for: host),
             port: port
@@ -846,13 +864,43 @@ extension MenubarController {
         }
         comps.path = "/admin/auto-login"
         var items = [URLQueryItem(name: "redirect", value: "/admin/dashboard")]
-        if let key = apiKey, !key.isEmpty {
-            items.append(URLQueryItem(name: "key", value: key))
+        if let token, !token.isEmpty {
+            items.append(URLQueryItem(name: "token", value: token))
         }
         comps.queryItems = items
         comps.percentEncodedQuery = comps.percentEncodedQuery?
             .replacingOccurrences(of: "+", with: "%2B")
         return comps.url
+    }
+
+    /// Exchanges the API key for a short-lived, single-use auto-login token
+    /// via POST /admin/api/auto-login-token (jundot/omlx#924). The key is
+    /// sent in a JSON body, never a URL, so it is never written to access
+    /// logs, browser history, or Referer headers. Throws on any network or
+    /// non-2xx failure; callers should treat that as "no token" and fall
+    /// back to the plain (logged-out) dashboard URL.
+    static func fetchAutoLoginToken(host: String, port: Int, apiKey: String) async throws -> String {
+        guard let url = AppConfig.httpURL(
+            host: AppConfig.connectableHost(for: host),
+            port: port,
+            path: "/admin/api/auto-login-token"
+        ) else {
+            throw URLError(.badURL)
+        }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(["api_key": apiKey])
+        req.timeoutInterval = 5.0
+
+        let session = URLSession(configuration: .ephemeral)
+        let (data, response) = try await session.data(for: req)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw URLError(.userAuthenticationRequired)
+        }
+        struct TokenResponse: Decodable { let token: String }
+        return try JSONDecoder().decode(TokenResponse.self, from: data).token
     }
 
     static func shouldShowGenericFailureAlert(message: String) -> Bool {

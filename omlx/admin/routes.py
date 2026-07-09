@@ -40,6 +40,8 @@ from .auth import (
     check_login_rate_limit,
     clear_login_attempts,
     compare_keys,
+    consume_auto_login_token,
+    create_auto_login_token,
     create_session_token,
     record_failed_login,
     request_is_https,
@@ -71,6 +73,12 @@ class SetupApiKeyRequest(BaseModel):
 
     api_key: str
     api_key_confirm: str
+
+
+class AutoLoginTokenRequest(BaseModel):
+    """Request model for exchanging an API key for an auto-login token."""
+
+    api_key: str
 
 
 class CreateSubKeyRequest(BaseModel):
@@ -1574,6 +1582,50 @@ async def setup_api_key(
     return {"success": True, "message": "API key configured successfully"}
 
 
+@router.post("/api/auto-login-token")
+async def create_auto_login_token_endpoint(
+    request: AutoLoginTokenRequest, http_request: Request
+):
+    """
+    Exchange the main API key for a short-lived, single-use auto-login token.
+
+    Used by the macOS menubar app: it POSTs the API key here (never in a
+    URL), then opens the browser at GET /admin/auto-login?token=... so the
+    key itself is never written to access logs, browser history, or
+    Referer headers (jundot/omlx#924).
+
+    Args:
+        request: AutoLoginTokenRequest containing the API key.
+        http_request: FastAPI Request, used to key the failed-login lockout.
+
+    Returns:
+        JSON with a one-time token valid for AUTO_LOGIN_TOKEN_TTL_SECONDS.
+
+    Raises:
+        HTTPException: 400 if no API key configured, 401 if invalid,
+            429 if too many recent failed attempts from this client.
+    """
+    client_key = http_request.client.host if http_request.client else "unknown"
+    check_login_rate_limit(client_key)
+
+    global_settings = _get_global_settings()
+    server_api_key = global_settings.auth.api_key if global_settings else None
+
+    if not server_api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="No API key configured. Please set up an API key first.",
+        )
+
+    # Main key only — sub keys must not grant admin login
+    if not verify_api_key(request.api_key, server_api_key):
+        record_failed_login(client_key)
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    clear_login_attempts(client_key)
+    return {"token": create_auto_login_token()}
+
+
 @router.post("/api/logout")
 async def logout(response: Response):
     """
@@ -1591,17 +1643,20 @@ async def logout(response: Response):
 
 @router.get("/auto-login")
 async def auto_login(
-    http_request: Request, key: str = "", redirect: str = "/admin/dashboard"
+    http_request: Request, token: str = "", redirect: str = "/admin/dashboard"
 ):
     """
-    Auto-login using API key and redirect to the target admin page.
+    Auto-login using a one-time token and redirect to the target admin page.
 
     Used by the macOS menubar app to open admin pages with automatic
-    authentication, bypassing the manual login form.
+    authentication, bypassing the manual login form. The app first
+    exchanges the API key for `token` via POST /admin/api/auto-login-token
+    (jundot/omlx#924) — the API key itself never appears in this URL, so it
+    is never written to access logs, browser history, or Referer headers.
 
     Args:
         http_request: FastAPI Request, used to detect HTTPS for the cookie.
-        key: The API key for authentication.
+        token: One-time token from POST /admin/api/auto-login-token.
         redirect: The path to redirect to after login. Must start with /admin.
 
     Returns:
@@ -1610,18 +1665,14 @@ async def auto_login(
     if not redirect.startswith("/admin"):
         raise HTTPException(status_code=400, detail="Invalid redirect path")
 
-    global_settings = _get_global_settings()
-    server_api_key = global_settings.auth.api_key if global_settings else None
-
-    # Main key only — sub keys must not grant admin login
-    if not key or not server_api_key or not verify_api_key(key, server_api_key):
+    if not consume_auto_login_token(token):
         return RedirectResponse(url="/admin", status_code=302)
 
-    token = create_session_token()
+    session_token = create_session_token()
     response = RedirectResponse(url=redirect, status_code=302)
     response.set_cookie(
         key="omlx_admin_session",
-        value=token,
+        value=session_token,
         httponly=True,
         samesite="lax",
         secure=request_is_https(http_request),

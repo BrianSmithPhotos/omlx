@@ -373,3 +373,49 @@ def clear_login_attempts(client_key: str) -> None:
     """Clear recorded failures for client_key, e.g. after a successful login."""
     with _login_attempts_lock:
         _failed_login_attempts.pop(client_key, None)
+
+
+# =============================================================================
+# Auto-login token exchange
+# =============================================================================
+#
+# GET /admin/auto-login used to accept the raw API key as a URL query
+# parameter, which gets written verbatim to uvicorn/proxy access logs,
+# browser history, and Referer headers (jundot/omlx#924). Instead, callers
+# (the macOS menubar app) POST the API key to /admin/api/auto-login-token
+# and receive one of these opaque, short-lived, single-use tokens to embed
+# in the GET URL. A leaked token is a much smaller exposure than a leaked
+# API key: it expires quickly and only works once.
+
+AUTO_LOGIN_TOKEN_TTL_SECONDS = 30
+
+_auto_login_tokens_lock = threading.Lock()
+_auto_login_tokens: dict[str, float] = {}
+
+
+def create_auto_login_token() -> str:
+    """Create a short-lived, single-use token for GET /admin/auto-login."""
+    now = time.monotonic()
+    token = secrets.token_urlsafe(32)
+    with _auto_login_tokens_lock:
+        # Opportunistic cleanup so unconsumed tokens don't accumulate
+        # forever on a long-running server.
+        expired = [t for t, exp in _auto_login_tokens.items() if exp <= now]
+        for t in expired:
+            del _auto_login_tokens[t]
+        _auto_login_tokens[token] = now + AUTO_LOGIN_TOKEN_TTL_SECONDS
+    return token
+
+
+def consume_auto_login_token(token: str) -> bool:
+    """Validate and single-use-consume an auto-login token.
+
+    Returns True at most once per token returned by create_auto_login_token,
+    and only within AUTO_LOGIN_TOKEN_TTL_SECONDS of its creation.
+    """
+    if not token:
+        return False
+    now = time.monotonic()
+    with _auto_login_tokens_lock:
+        expires_at = _auto_login_tokens.pop(token, None)
+    return expires_at is not None and now < expires_at
