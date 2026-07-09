@@ -420,7 +420,10 @@
             oqeStrictImatrix: false,
 
             // oQ Uploader state
-            uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
+            // sessionStorage (not localStorage): an HF token is a live
+            // credential, so it should not survive past the browser tab/
+            // session the way UI preferences do.
+            uploadHfToken: sessionStorage.getItem('omlx-hf-upload-token') || '',
             uploadHfUsername: '',
             uploadHfOrgs: [],
             uploadHfNamespace: '',
@@ -4684,7 +4687,7 @@
                         this.uploadHfOrgs = data.orgs || [];
                         this.uploadHfNamespace = this.uploadHfUsername;
                         this.uploadTokenValidated = true;
-                        localStorage.setItem('omlx-hf-upload-token', this.uploadHfToken);
+                        sessionStorage.setItem('omlx-hf-upload-token', this.uploadHfToken);
                         this.loadUploadOqModels();
                     } else {
                         this.uploadError = data.detail || window.t('models.uploader.invalid_token');
