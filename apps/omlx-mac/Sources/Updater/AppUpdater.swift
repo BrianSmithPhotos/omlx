@@ -1,11 +1,23 @@
 // In-place auto-updater — direct port of the PyObjC menubar's updater.
 //
 // Flow: download .dmg → hdiutil attach → copy the inner oMLX.app next to
-// the running bundle as `.oMLX-update.app` → hdiutil detach → on
-// confirmation, spawn a detached bash script that waits for our PID to
-// exit, swaps the staged bundle into place, strips the quarantine xattr,
-// and `open`s the new bundle. No EdDSA signature check — Apple's
-// notarization stapled to the DMG is the trust boundary.
+// the running bundle as `.oMLX-update.app` → verify its code signature and
+// signing team against the running app → hdiutil detach → on confirmation,
+// spawn a detached bash script that waits for our PID to exit, swaps the
+// staged bundle into place, strips the quarantine xattr, and `open`s the
+// new bundle.
+//
+// Trust boundary (jundot/omlx#930): the swap script strips the quarantine
+// xattr before opening the new bundle so an unattended relaunch doesn't hit
+// Gatekeeper's "unidentified developer" prompt — but that also means
+// Gatekeeper's signature check never runs for this launch. `hdiutil attach`
+// previously passed `-noverify`, which also skips the DMG's own checksum
+// verification. Together those meant a MITM'd or compromised release asset
+// could install and run with no integrity check at all. Both are fixed
+// here: `-noverify` is removed, and `verifyStagedSignature` runs
+// `codesign --verify` plus a Team ID match against the running app before
+// the staged bundle is ever allowed to become `onReady()` (and therefore
+// swappable).
 //
 // Cancellation: `cancel()` is best-effort; an in-flight download exits at
 // the next stream chunk. A staged copy that's already on disk gets
@@ -22,6 +34,7 @@ final class AppUpdater {
         case mountFailed(String)
         case appNotFoundInVolume
         case stageFailed(String)
+        case signatureVerificationFailed(String)
         case cancelled
 
         var description: String {
@@ -32,6 +45,7 @@ final class AppUpdater {
             case .mountFailed(let m): return "Could not mount DMG: \(m)"
             case .appNotFoundInVolume: return "oMLX.app not found inside the downloaded DMG"
             case .stageFailed(let m): return "Could not stage the update: \(m)"
+            case .signatureVerificationFailed(let m): return "Update failed signature verification: \(m)"
             case .cancelled: return "Update cancelled"
             }
         }
@@ -156,6 +170,17 @@ final class AppUpdater {
             onError(err); return
         } catch {
             onError(.stageFailed(error.localizedDescription)); return
+        }
+
+        if cancelled { return }
+        do {
+            try Self.verifyStagedSignature(stagedApp, against: app)
+        } catch let err as UpdateError {
+            try? FileManager.default.removeItem(at: stagedApp)
+            onError(err); return
+        } catch {
+            try? FileManager.default.removeItem(at: stagedApp)
+            onError(.signatureVerificationFailed(error.localizedDescription)); return
         }
 
         if cancelled { return }
@@ -287,7 +312,7 @@ final class AppUpdater {
     private func mountDMG(at dmg: URL) throws -> URL {
         let result = try runProcess(
             "/usr/bin/hdiutil",
-            args: ["attach", "-nobrowse", "-noverify", "-noautoopen", "-mountrandom", "/tmp", dmg.path]
+            args: ["attach", "-nobrowse", "-noautoopen", "-mountrandom", "/tmp", dmg.path]
         )
         guard result.status == 0 else {
             throw UpdateError.mountFailed(result.stderr.isEmpty ? result.stdout : result.stderr)
@@ -343,6 +368,58 @@ final class AppUpdater {
             return mountPoint.appendingPathComponent(name)
         }
         throw UpdateError.appNotFoundInVolume
+    }
+
+    // MARK: - Signature verification
+
+    /// Verifies the staged update is validly signed and comes from the same
+    /// developer as the running app before it's allowed to become
+    /// `onReady()` (and therefore swappable). `performSwapAndRelaunch()`
+    /// strips the quarantine xattr before opening the swapped-in bundle so
+    /// an unattended relaunch doesn't hit Gatekeeper's "unidentified
+    /// developer" prompt — but that also means Gatekeeper's own signature
+    /// check never runs for this launch. This check stands in for it
+    /// (jundot/omlx#930): a MITM'd DMG or a compromised/substituted release
+    /// asset is caught here instead of silently executing.
+    nonisolated static func verifyStagedSignature(_ staged: URL, against runningApp: URL) throws {
+        let verify = try runProcess(
+            "/usr/bin/codesign",
+            args: ["--verify", "--strict", "--deep", staged.path]
+        )
+        guard verify.status == 0 else {
+            throw UpdateError.signatureVerificationFailed(
+                verify.stderr.isEmpty ? "codesign --verify failed" : verify.stderr
+            )
+        }
+
+        guard let stagedTeamID = try teamIdentifier(of: staged) else {
+            throw UpdateError.signatureVerificationFailed("Update is not signed with a Team ID")
+        }
+        guard let runningTeamID = try Self.teamIdentifier(of: runningApp) else {
+            // The running app itself has no Team ID (e.g. an ad-hoc local
+            // dev build) — there's nothing trustworthy to compare against,
+            // so fail closed rather than accepting any signed update.
+            throw UpdateError.signatureVerificationFailed(
+                "Running app has no Team ID to verify the update against"
+            )
+        }
+        guard stagedTeamID == runningTeamID else {
+            throw UpdateError.signatureVerificationFailed(
+                "Update's signing team (\(stagedTeamID)) does not match the running app (\(runningTeamID))"
+            )
+        }
+    }
+
+    nonisolated static func teamIdentifier(of app: URL) throws -> String? {
+        let result = try runProcess("/usr/bin/codesign", args: ["-dv", "--verbose=4", app.path])
+        // codesign -dv writes its info to stderr, not stdout.
+        for line in result.stderr.split(whereSeparator: \.isNewline) {
+            if line.hasPrefix("TeamIdentifier=") {
+                let value = line.dropFirst("TeamIdentifier=".count)
+                return value == "not set" ? nil : String(value)
+            }
+        }
+        return nil
     }
 
     // MARK: - Swap + relaunch (called from outside, right before terminate)
