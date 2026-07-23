@@ -13,14 +13,29 @@ materializes the score matrix -> peak memory O(L). It rides MLX's GEMM, so speed
 is on par with the fallback; the win is memory. ``register_tiled_prefill_head_dim``
 flips the prefill-guard estimator to O(L) in lockstep (else it keeps rejecting).
 
+The route is memory-aware (issue #2204): the unfused fallback is faster
+everywhere its score matrix fits (on NAX GPUs its big GEMMs run on the tensor
+units; even pre-NAX it is ~2x faster than the tiled pass at long context, issue
+#2155), so when the Scheduler has registered a headroom provider the tiled pass
+engages only if the unfused transient would NOT fit under the prefill-guard
+ceiling. Without a provider (no Scheduler, ceiling not propagated yet) the
+route keeps the memory-safe default: always tiled past the kv_len threshold.
+``OMLX_SDPA256_TILED=1`` forces the tiled pass whenever the shape gates match
+(pre-#2204 behavior); ``OMLX_SDPA256_TILED=0`` never engages it (restores the
+O(L^2) memory wall — benchmarking only).
+
 Install mechanics mirror turboquant_attention.py (patch the module attr + rebind
 already-imported model modules). The route is strictly gated (see _should_route);
 everything else passes through to the original SDPA unchanged.
 """
 
 import logging
+import os
+import weakref
 
 import mlx.core as mx
+
+from omlx.memory_monitor import estimate_unfused_sdpa_call_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +58,103 @@ _Q_TILE = 512
 _KV_TILE = 1024
 
 _NEG_INF = -1e30  # fp32 sentinel for masked logits (exp -> 0)
+
+# Live guard-headroom provider for memory-aware routing (issue #2204).
+# Registered by Scheduler.__init__ as a bound method returning the bytes left
+# under the adaptive-prefill-throttle target (hard ceiling x headroom safety,
+# clamped by the abort cap), or a negative value when no ceiling is active.
+# Held as a WeakMethod so a torn-down Scheduler auto-unregisters and the route
+# falls back to the memory-safe always-tiled default.
+_HEADROOM_PROVIDER: "weakref.WeakMethod | None" = None
+# OMLX_SDPA256_TILED override, parsed at apply time: True = always tiled,
+# False = never tiled, None = memory-aware auto.
+_FORCE_TILED: bool | None = None
+# Tiled-route reasons already logged. The tiled pass trades substantial
+# prefill throughput at long kv_len for O(L) memory, and nothing surfaced the
+# route decision before (issue #2283 took an A/B repro to diagnose), so the
+# first engagement per reason logs at INFO; repeats stay silent to keep the
+# hot path quiet.
+_TILED_ROUTE_LOGGED: "set[str]" = set()
+
+
+def _note_tiled_route(reason: str, detail: str) -> None:
+    if reason in _TILED_ROUTE_LOGGED:
+        return
+    _TILED_ROUTE_LOGGED.add(reason)
+    logger.info(
+        "sdpa256: head-dim-256 prefill taking the tiled (memory-safe, slower) "
+        "path: %s. The unfused fast path resumes when guard headroom allows; "
+        "OMLX_SDPA256_TILED=1/0 forces the route.",
+        detail,
+    )
+
+
+def set_unfused_headroom_provider(method) -> None:
+    """Register a bound method returning the prefill guard's live headroom in
+    bytes (negative when no ceiling is active). Lets ``_should_route`` prefer
+    the faster unfused fallback whenever its O(L^2) transient fits."""
+    global _HEADROOM_PROVIDER
+    _HEADROOM_PROVIDER = weakref.WeakMethod(method)
+
+
+def _parse_force_tiled_env() -> bool | None:
+    value = os.environ.get("OMLX_SDPA256_TILED", "").strip()
+    if value == "1":
+        return True
+    if value == "0":
+        return False
+    return None
+
+
+def _tiled_route_required(queries, keys) -> bool:
+    """Decide tiled vs stock for a shape-matched prefill call (True = tiled).
+
+    The stock unfused fallback is faster wherever its score matrix fits
+    (issues #2155 / #2204), so take the tiled pass only when the unfused
+    transient would not fit under the guard ceiling — or when no headroom
+    info is available, keeping the memory-safe #2025 behavior."""
+    if _FORCE_TILED is not None:
+        if _FORCE_TILED:
+            _note_tiled_route("forced", "forced by OMLX_SDPA256_TILED=1")
+        return _FORCE_TILED
+    try:
+        provider = _HEADROOM_PROVIDER() if _HEADROOM_PROVIDER is not None else None
+        if provider is None:
+            _note_tiled_route(
+                "no-provider",
+                "no guard headroom provider registered "
+                "(engine without a scheduler, or scheduler gone)",
+            )
+            return True
+        headroom = provider()
+        if headroom is None or headroom < 0:
+            _note_tiled_route(
+                "no-ceiling",
+                "memory ceiling not available (enforcer state not yet "
+                "propagated)",
+            )
+            return True
+        batch, n_q, q_len, _ = queries.shape
+        transient = estimate_unfused_sdpa_call_bytes(
+            batch * n_q,
+            q_len,
+            keys.shape[-2],
+            HEAD_DIM,
+            score_dtype_size=queries.dtype.size,
+        )
+        if transient > headroom:
+            _note_tiled_route(
+                "insufficient-headroom",
+                f"unfused transient ~{transient / 2**20:.0f}MiB exceeds live "
+                f"guard headroom ~{headroom / 2**20:.0f}MiB at "
+                f"kv_len={keys.shape[-2]}",
+            )
+            return True
+        return False
+    except Exception:
+        _note_tiled_route("probe-error", "guard headroom probe failed")
+        logger.debug("sdpa256 headroom probe failed", exc_info=True)
+        return True  # headroom info unavailable -> memory-safe default
 
 
 def _flash_sdpa256(queries, keys, values, scale, mask):
@@ -140,7 +252,9 @@ def _should_route(queries, keys, cache, mask, sinks) -> bool:
             return False
         n_q = queries.shape[-3]
         n_kv = keys.shape[-3]
-        return not (n_kv <= 0 or n_q % n_kv != 0)
+        if n_kv <= 0 or n_q % n_kv != 0:
+            return False
+        return _tiled_route_required(queries, keys)
     except Exception:
         return False
 
@@ -148,10 +262,11 @@ def _should_route(queries, keys, cache, mask, sinks) -> bool:
 def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool:
     """Monkey-patch mlx-lm's scaled_dot_product_attention for head_dim=256
     long-context prefill, and register the O(L) cost with the memory monitor."""
-    global _PATCHED, _SDPA256_MIN_KV_LEN
+    global _PATCHED, _SDPA256_MIN_KV_LEN, _FORCE_TILED
     if _PATCHED:
         return False
     _SDPA256_MIN_KV_LEN = min_kv_len
+    _FORCE_TILED = _parse_force_tiled_env()
 
     try:
         from mlx_lm.models import base as mlx_base
@@ -219,9 +334,15 @@ def apply_sdpa256_attention_patch(min_kv_len: int = _SDPA256_MIN_KV_LEN) -> bool
         logger.debug("could not register sdpa256 with memory_monitor", exc_info=True)
 
     _PATCHED = True
+    if _FORCE_TILED is None:
+        routing = "tiled only when unfused exceeds guard headroom"
+    elif _FORCE_TILED:
+        routing = "always tiled (OMLX_SDPA256_TILED=1)"
+    else:
+        routing = "never tiled (OMLX_SDPA256_TILED=0)"
     logger.info(
-        "sdpa256 attention patch applied (head_dim=256 prefill, kv_len>=%d -> "
-        "O(L) tiled kernel)",
+        "sdpa256 attention patch applied (head_dim=256 prefill, kv_len>=%d, %s)",
         min_kv_len,
+        routing,
     )
     return True

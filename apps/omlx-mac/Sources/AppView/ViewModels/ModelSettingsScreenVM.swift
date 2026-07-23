@@ -58,19 +58,19 @@ final class ModelSettingsScreenVM {
             ("vlm", String(localized: "settings.model_type.vlm",
                            defaultValue: "VLM",
                            comment: "Model type option label for vision-language models")),
-            ("embed", String(localized: "settings.model_type.embed",
-                             defaultValue: "Embedding",
-                             comment: "Model type option label for embedding models")),
-            ("rerank", String(localized: "settings.model_type.rerank",
-                              defaultValue: "Reranker",
-                              comment: "Model type option label for reranker models")),
-            ("audio-stt", String(localized: "settings.model_type.audio_stt",
+            ("embedding", String(localized: "settings.model_type.embed",
+                                 defaultValue: "Embedding",
+                                 comment: "Model type option label for embedding models")),
+            ("reranker", String(localized: "settings.model_type.rerank",
+                                defaultValue: "Reranker",
+                                comment: "Model type option label for reranker models")),
+            ("audio_stt", String(localized: "settings.model_type.audio_stt",
                                  defaultValue: "Audio STT",
                                  comment: "Model type option label for speech-to-text models")),
-            ("audio-tts", String(localized: "settings.model_type.audio_tts",
+            ("audio_tts", String(localized: "settings.model_type.audio_tts",
                                  defaultValue: "Audio TTS",
                                  comment: "Model type option label for text-to-speech models")),
-            ("audio-sts", String(localized: "settings.model_type.audio_sts",
+            ("audio_sts", String(localized: "settings.model_type.audio_sts",
                                  defaultValue: "Audio STS",
                                  comment: "Model type option label for speech-to-speech models")),
         ]
@@ -754,8 +754,8 @@ final class ModelSettingsScreenVM {
         }
         if vlmMtpEnabled {
             return String(localized: "settings.mtp.conflict.vlm_mtp",
-                          defaultValue: "Disable VLM MTP before enabling Native MTP.",
-                          comment: "Tooltip / sublabel shown when native MTP can't be enabled because VLM MTP is on")
+                          defaultValue: "Disable VLM MTP before enabling Lightning MTP.",
+                          comment: "Tooltip / sublabel shown when Lightning MTP can't be enabled because VLM MTP is on")
         }
         return nil
     }
@@ -776,8 +776,8 @@ final class ModelSettingsScreenVM {
         }
         if mtpEnabled {
             return String(localized: "settings.vlm_mtp.conflict.mtp",
-                          defaultValue: "Disable Native MTP before enabling VLM MTP.",
-                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because native MTP is on")
+                          defaultValue: "Disable Lightning MTP before enabling VLM MTP.",
+                          comment: "Tooltip / sublabel shown when VLM MTP can't be enabled because Lightning MTP is on")
         }
         if turboquantKvEnabled {
             return String(localized: "settings.vlm_mtp.conflict.turboquant",
