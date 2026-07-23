@@ -3304,6 +3304,12 @@
             "value" : "취소"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отменить"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -3314,12 +3320,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "取消"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Отменить"
           }
         }
       }
@@ -6314,6 +6314,30 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Модели не найдены"
+          }
+        }
+      }
+    },
+    "models.library.favorite_off.help" : {
+      "comment" : "Tooltip on the outlined star that adds a model to favorites",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Add to favorites"
+          }
+        }
+      }
+    },
+    "models.library.favorite_on.help" : {
+      "comment" : "Tooltip on the filled star that removes a model from favorites",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Favorite — click to remove"
           }
         }
       }
@@ -14207,6 +14231,30 @@
         }
       }
     },
+    "settings.advanced.favorite.label" : {
+      "comment" : "Row label for the favorite toggle",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Favorite"
+          }
+        }
+      }
+    },
+    "settings.advanced.favorite.sub" : {
+      "comment" : "Sublabel for the favorite toggle",
+      "extractionState" : "extracted_with_value",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "List this model first in model lists"
+          }
+        }
+      }
+    },
     "settings.advanced.force_sampling.label" : {
       "comment" : "Row label for the force-sampling toggle",
       "extractionState" : "manual",
@@ -16981,6 +17029,12 @@
             "value" : "정확도"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Точность"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -16991,12 +17045,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "準確度"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Точность"
           }
         }
       }
@@ -17022,6 +17070,12 @@
             "value" : "다운로드"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загрузки"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17032,12 +17086,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "下載工具"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Загрузки"
           }
         }
       }
@@ -17152,6 +17200,12 @@
             "value" : "로그"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Логи"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17162,12 +17216,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "記錄"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Логи"
           }
         }
       }
@@ -17193,6 +17241,12 @@
             "value" : "모델"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Модели"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17203,12 +17257,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "模型"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Модели"
           }
         }
       }
@@ -17234,6 +17282,12 @@
             "value" : "네트워크"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сеть"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17244,12 +17298,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "網絡"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Сеть"
           }
         }
       }
@@ -17275,6 +17323,12 @@
             "value" : "성능"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Производительность"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17285,12 +17339,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "效能"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Производительность"
           }
         }
       }
@@ -17316,6 +17364,12 @@
             "value" : "양자화"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Квантование"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17326,12 +17380,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "量化"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Квантование"
           }
         }
       }
@@ -17374,6 +17422,12 @@
             "value" : "대시보드"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сервер"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17384,12 +17438,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "儀表板"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Сервер"
           }
         }
       }
@@ -17415,6 +17463,12 @@
             "value" : "서빙 통계"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Статус"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17425,12 +17479,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "服務統計"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Статус"
           }
         }
       }
@@ -17456,6 +17504,12 @@
             "value" : "처리량"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Пропускная способность"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -17466,12 +17520,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "吞吐量"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Пропускная способность"
           }
         }
       }
@@ -17928,7 +17976,7 @@
     },
     "status.runtime_cache.file_count.other" : {
       "comment" : "Cache file count; placeholder is the number of files",
-      "extractionState" : "extracted_with_value",
+      "extractionState" : "stale",
       "localizations" : {
         "en" : {
           "stringUnit" : {
@@ -18036,7 +18084,7 @@
     },
     "status.runtime_cache.memory_entries.one" : {
       "comment" : "Singular memory cache entry count",
-      "extractionState" : "extracted_with_value",
+      "extractionState" : "stale",
       "localizations" : {
         "en" : {
           "stringUnit" : {
@@ -18054,7 +18102,7 @@
     },
     "status.runtime_cache.memory_entries.other" : {
       "comment" : "Memory cache entry count; placeholder is the number of entries",
-      "extractionState" : "extracted_with_value",
+      "extractionState" : "stale",
       "localizations" : {
         "en" : {
           "stringUnit" : {
@@ -18109,6 +18157,12 @@
             "value" : "누적"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "За все время"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18119,12 +18173,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "累計"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "За все время"
           }
         }
       }
@@ -18150,6 +18198,12 @@
             "value" : "세션"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сессия"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18160,12 +18214,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "工作階段"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Сессия"
           }
         }
       }
@@ -18245,6 +18293,12 @@
             "value" : "서빙 통계"
           }
         },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Статистика обслуживания"
+          }
+        },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
@@ -18255,12 +18309,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "服務統計"
-          }
-        },
-        "ru" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Статистика обслуживания"
           }
         }
       }
