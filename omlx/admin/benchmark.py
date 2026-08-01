@@ -8,15 +8,19 @@ real-time progress reporting via SSE events.
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, field_validator
 
+from ..utils.proc_memory import get_lifetime_max_phys_footprint
+from ..utils.system_sampler import SystemSampler
 from .external_api import ExternalAPIClient, ExternalEndpointConfig
 
 try:
@@ -94,10 +98,19 @@ class BenchmarkRun:
     task: Optional[asyncio.Task] = None
     results: list[dict] = field(default_factory=list)
     error_message: str = ""
-    # Experimental flags active when the benchmark started. When non-empty
-    # the run's results are not uploaded to omlx.ai community benchmarks
-    # because experimental features skew the numbers.
+    # Acceleration features active when the benchmark started. Results are
+    # uploaded either way; the flags ride along so the leaderboard can mark
+    # and filter them instead of silently mixing them in.
     experimental_features: list[str] = field(default_factory=list)
+    # Same snapshot in the upload payload's shape: [{key, label, detail?}].
+    feature_flags: list[dict] = field(default_factory=list)
+    # Performance-relevant subset of the model's settings at run start.
+    model_settings_snapshot: Optional[dict] = None
+    # Host telemetry sampler, running for the duration of the tests.
+    sampler: Optional[Any] = None
+    # Lifetime footprint high-water mark before the tests began, so the run's
+    # own peak can be told apart from a larger one set earlier in the process.
+    lifetime_footprint_at_start: int = 0
     # Mirror of the upload SSE events so REST consumers (e.g. native Swift
     # app polling /results) can render leaderboard status without opening
     # the stream. Phases: "idle" → "uploading" → "done" | "skipped". The
@@ -110,33 +123,205 @@ class BenchmarkRun:
         "success_count": 0,
         "failed_count": 0,
         "owner_hash": None,     # display hash, populated on upload_done
-        "skipped_reason": None, # e.g. "experimental_features"
+        "skipped_reason": None, # only "external_endpoint" reaches this now
+        # Always empty. Kept because BenchDTO.swift declares it non-optional,
+        # so dropping the key would fail decoding on every app build that has
+        # not been updated — which turns into a per-second error loop while the
+        # results poller runs.
         "skipped_features": [],
+        "feature_flags": [],    # [{key, label, detail?}]
     })
 
 
 # Event types that close the SSE stream for a bench run. `done` is NOT
 # terminal — it marks "tests finished, upload starting"; the real end of
-# stream is `upload_done` (or `error`).
-_BENCH_TERMINAL_TYPES = frozenset({"upload_done", "error"})
+# stream is `upload_done` (or `error`). `upload_skipped` is the external
+# endpoint's last event: without it here, subscribers to an external run would
+# wait for an `upload_done` that never comes.
+_BENCH_TERMINAL_TYPES = frozenset({"upload_done", "upload_skipped", "error"})
 
 
-_EXPERIMENTAL_FEATURE_FLAGS = (
-    ("dflash_enabled", "dflash"),
-    ("specprefill_enabled", "specprefill"),
-    ("turboquant_kv_enabled", "turboquant"),
-    ("mtp_enabled", "mtp"),
-    ("vlm_mtp_enabled", "vlm_mtp"),
+@dataclass(frozen=True)
+class _FeatureFlagSpec:
+    """One acceleration toggle, in both the legacy and upload projections."""
+
+    attr: str
+    legacy: str
+    key: str
+    label: str
+    detail_attr: Optional[str] = None
+    detail_key_fmt: Optional[str] = None
+    detail_label_fmt: Optional[str] = None
+
+
+# `mtp_enabled` is surfaced as "Lightning MTP" everywhere in the UI, so the
+# upload key follows the user-facing name rather than the settings field.
+_FEATURE_FLAG_SPECS = (
+    _FeatureFlagSpec("dflash_enabled", "dflash", "dflash", "DFlash"),
+    _FeatureFlagSpec("specprefill_enabled", "specprefill", "specprefill", "SpecPrefill"),
+    _FeatureFlagSpec(
+        "turboquant_kv_enabled",
+        "turboquant",
+        "turboquant_kv",
+        "TurboQuant KV",
+        detail_attr="turboquant_kv_bits",
+        detail_key_fmt="_{}bit",
+        detail_label_fmt=" {}-bit",
+    ),
+    _FeatureFlagSpec("mtp_enabled", "mtp", "lightning_mtp", "Lightning MTP"),
+    _FeatureFlagSpec("vlm_mtp_enabled", "vlm_mtp", "vlm_mtp", "VLM MTP"),
 )
+
+
+def _sample_window(run: "BenchmarkRun", window_start: float) -> Optional[dict]:
+    """Aggregate host telemetry for the interval a single test occupied."""
+    if run.sampler is None:
+        return None
+    try:
+        return run.sampler.window(window_start, time.monotonic())
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Benchmark: system metrics unavailable: {e}")
+        return None
 
 
 def _detect_experimental_features(model_settings: Any) -> list[str]:
     """Return benchmark-skewing model features enabled in settings."""
     return [
-        feature
-        for attr, feature in _EXPERIMENTAL_FEATURE_FLAGS
-        if getattr(model_settings, attr, False)
+        spec.legacy
+        for spec in _FEATURE_FLAG_SPECS
+        if getattr(model_settings, spec.attr, False)
     ]
+
+
+def _format_bits(value: Any) -> Optional[str]:
+    """Render a bit-width for display, dropping a trailing .0 (4.0 -> "4")."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f"{number:g}"
+
+
+def _derive_feature_flags(model_settings: Any) -> list[dict]:
+    """Build the upload projection of the active acceleration features.
+
+    Objects rather than bare keys: the app and omlx.ai ship independently, so
+    carrying the display label means a newly added feature renders correctly on
+    the site from day one instead of showing a raw snake_case key until the
+    next site deploy. Only active features are included — the site derives
+    "this run was accelerated" from the list being non-empty.
+    """
+    flags: list[dict] = []
+    for spec in _FEATURE_FLAG_SPECS:
+        if not getattr(model_settings, spec.attr, False):
+            continue
+        key, label = spec.key, spec.label
+        if spec.detail_attr:
+            bits = _format_bits(getattr(model_settings, spec.detail_attr, None))
+            if bits:
+                # Keys must stay [a-z0-9_], so 2.5 becomes 2_5.
+                key += spec.detail_key_fmt.format(bits.replace(".", "_"))
+                label += spec.detail_label_fmt.format(bits)
+        flags.append({"key": key, "label": label})
+    return flags
+
+
+# Performance-relevant settings only, as an allowlist rather than a denylist:
+# ModelSettings gains fields regularly, and a denylist would ship every future
+# addition to a public endpoint by default.
+#
+# Excluded on purpose: display_name / description / model_alias (user-authored
+# free text), is_pinned / is_default / is_hidden / is_favorite /
+# active_profile_name / ttl_seconds (local organization), the guided_grammar
+# body (unbounded; the boolean is kept), chat_template_kwargs and
+# forced_ct_kwargs (arbitrary user dicts), and trust_remote_code (security
+# posture, not performance). The *_draft_model fields are included but reduced
+# to a basename — the drafter's identity explains an MTP/DFlash result, while
+# the full path would leak the local filesystem layout and the OS username.
+_UPLOADED_SETTING_FIELDS = (
+    "max_context_window",
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "repetition_penalty",
+    "presence_penalty",
+    "force_sampling",
+    "enable_thinking",
+    "thinking_budget_enabled",
+    "thinking_budget_tokens",
+    "reasoning_parser",
+    "guided_grammar_enabled",
+    "model_type_override",
+    "index_cache_freq",
+    "turboquant_kv_enabled",
+    "turboquant_kv_bits",
+    "turboquant_skip_last",
+    "specprefill_enabled",
+    "specprefill_draft_model",
+    "specprefill_keep_pct",
+    "specprefill_threshold",
+    "dflash_enabled",
+    "dflash_draft_model",
+    "dflash_draft_quant_enabled",
+    "dflash_draft_quant_weight_bits",
+    "dflash_draft_quant_activation_bits",
+    "dflash_draft_quant_group_size",
+    "dflash_max_ctx",
+    "dflash_in_memory_cache",
+    "dflash_in_memory_cache_max_entries",
+    "dflash_ssd_cache",
+    "dflash_draft_window_size",
+    "dflash_draft_sink_size",
+    "dflash_verify_mode",
+    "mtp_enabled",
+    "mtp_num_draft_tokens",
+    "vlm_mtp_enabled",
+    "vlm_mtp_draft_model",
+    "vlm_mtp_draft_block_size",
+)
+
+_PATH_VALUED_SETTING_FIELDS = frozenset({
+    "specprefill_draft_model",
+    "dflash_draft_model",
+    "vlm_mtp_draft_model",
+})
+
+_MAX_UPLOADED_SETTINGS_BYTES = 4096
+
+
+def _filter_uploaded_settings(model_settings: Any) -> Optional[dict]:
+    """Project model settings onto the uploadable allowlist."""
+    to_dict = getattr(model_settings, "to_dict", None)
+    if not callable(to_dict):
+        return None
+    try:
+        raw = to_dict()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Benchmark: failed to serialize model settings: {e}")
+        return None
+
+    filtered: dict = {}
+    for key in _UPLOADED_SETTING_FIELDS:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if key in _PATH_VALUED_SETTING_FIELDS and isinstance(value, str):
+            value = os.path.basename(value.rstrip("/")) or value
+        filtered[key] = value
+
+    if len(json.dumps(filtered, separators=(",", ":"))) > _MAX_UPLOADED_SETTINGS_BYTES:
+        logger.warning(
+            "Benchmark: model settings snapshot exceeded "
+            f"{_MAX_UPLOADED_SETTINGS_BYTES} bytes, uploading accelerator flags only"
+        )
+        filtered = {
+            spec.attr: filtered[spec.attr]
+            for spec in _FEATURE_FLAG_SPECS
+            if spec.attr in filtered
+        }
+    return filtered
 
 
 def get_run(bench_id: str) -> Optional[BenchmarkRun]:
@@ -179,41 +364,74 @@ def cleanup_old_runs(max_runs: int = 10) -> None:
 
 
 
-def _generate_prompt(tokenizer: Any, target_tokens: int) -> str:
-    """Generate a prompt with exactly target_tokens tokens.
+# Natural-language corpus for benchmark prompts (public-domain text of
+# Project Gutenberg eBook #2701, boilerplate stripped). Prompts must not be
+# built from repeated filler: speculative decoders (Lightning MTP, DFlash)
+# reach ~99% draft acceptance on repetitive text versus ~55-80% on natural
+# text, which inflates benchmark tg by roughly 2x over anything real
+# requests can achieve on those models.
+_BENCH_CORPUS_PATH = Path(__file__).parent / "bench_corpus.txt"
+_BENCH_CORPUS_START = "Call me Ishmael."
+
+# Approximate characters per token for natural English prose in common BPE
+# vocabularies; used only by the tokenizer-less external path, which reports
+# the endpoint's actual usage.prompt_tokens anyway.
+_CORPUS_CHARS_PER_TOKEN = 4
+_PROMPT_BUILD_MAX_ATTEMPTS = 16
+
+
+@lru_cache(maxsize=1)
+def _load_bench_corpus() -> str:
+    corpus = _BENCH_CORPUS_PATH.read_text(encoding="utf-8")
+    start = corpus.find(_BENCH_CORPUS_START)
+    if start < 0:
+        raise RuntimeError(
+            f"Benchmark corpus at {_BENCH_CORPUS_PATH} is missing "
+            f"the prose start marker"
+        )
+    return corpus[start:]
+
+
+def _generate_prompt(tokenizer: Any, target_tokens: int) -> list[int]:
+    """Generate exactly ``target_tokens`` natural-text token IDs.
 
     Uses a unique UUID prefix to prevent SSD cache hits from previous sessions.
+    The prefix and corpus are encoded together so tokenizer boundary merges and
+    special-token insertion happen exactly once. The token IDs are passed to the
+    engine directly; decoding them back to text would make exact length depend
+    on tokenizer round-trip behavior.
     """
+    if target_tokens <= 0:
+        raise ValueError("target_tokens must be positive")
+
     unique_prefix = f"BENCH-{uuid.uuid4().hex} "
-    filler = (
-        "The quick brown fox jumps over the lazy dog. "
-        "In the realm of artificial intelligence, large language models "
-        "have demonstrated remarkable capabilities across diverse tasks. "
+    corpus = _load_bench_corpus()
+    if not corpus:
+        raise RuntimeError(f"Benchmark corpus at {_BENCH_CORPUS_PATH} is empty")
+
+    target_chars = max(target_tokens * _CORPUS_CHARS_PER_TOKEN, 1)
+    for _ in range(_PROMPT_BUILD_MAX_ATTEMPTS):
+        repeats = (target_chars + len(corpus) - 1) // len(corpus)
+        body = (corpus * repeats)[:target_chars]
+        tokens = [int(token) for token in tokenizer.encode(unique_prefix + body)]
+        if len(tokens) >= target_tokens:
+            return tokens[:target_tokens]
+        if not tokens:
+            raise RuntimeError(
+                f"Benchmark corpus at {_BENCH_CORPUS_PATH} tokenized to 0 tokens"
+            )
+
+        # Scale by the observed tokenizer ratio, rounding up. The +1 guarantees
+        # progress even for tokenizers with coarse or unusual segmentation.
+        target_chars = max(
+            target_chars + 1,
+            (target_chars * target_tokens + len(tokens) - 1) // len(tokens) + 1,
+        )
+
+    raise RuntimeError(
+        f"Could not build an exact {target_tokens}-token benchmark prompt "
+        f"after {_PROMPT_BUILD_MAX_ATTEMPTS} attempts"
     )
-
-    # Build a large enough text
-    text = unique_prefix + filler * (target_tokens // 10 + 1)
-    tokens = tokenizer.encode(text)
-
-    if len(tokens) < target_tokens:
-        # Need more tokens, repeat more
-        text = unique_prefix + filler * (target_tokens // 5 + 1)
-        tokens = tokenizer.encode(text)
-
-    # Truncate to exact target length
-    tokens = tokens[:target_tokens]
-    return tokenizer.decode(tokens)
-
-
-# The external path has no tokenizer, so prompt lengths are approximated by
-# repeating this filler (~30 tokens per repetition in common BPE vocabs).
-# Results report the endpoint's actual usage.prompt_tokens.
-_EXTERNAL_FILLER = (
-    "The quick brown fox jumps over the lazy dog. "
-    "In the realm of artificial intelligence, large language models "
-    "have demonstrated remarkable capabilities across diverse tasks. "
-)
-_EXTERNAL_FILLER_TOKENS = 30
 
 
 def _generate_external_prompt(target_tokens: int) -> str:
@@ -222,8 +440,15 @@ def _generate_external_prompt(target_tokens: int) -> str:
     Uses a unique UUID prefix so remote prefix caches cannot skew results.
     """
     unique_prefix = f"BENCH-{uuid.uuid4().hex} "
-    repeats = max(1, target_tokens // _EXTERNAL_FILLER_TOKENS)
-    return unique_prefix + _EXTERNAL_FILLER * repeats
+    corpus = _load_bench_corpus()
+    if not corpus:
+        raise RuntimeError(f"Benchmark corpus at {_BENCH_CORPUS_PATH} is empty")
+    target_chars = max(
+        0,
+        target_tokens * _CORPUS_CHARS_PER_TOKEN - len(unique_prefix),
+    )
+    repeats = (target_chars + len(corpus) - 1) // len(corpus)
+    return unique_prefix + (corpus * repeats)[:target_chars]
 
 
 def _compute_single_metrics(
@@ -237,6 +462,7 @@ def _compute_single_metrics(
     prefill_duration_s: float | None = None,
     generation_duration_s: float | None = None,
     generation_measured: bool = True,
+    timing_observed: bool = True,
 ) -> dict:
     """Compute all metrics for a single request benchmark."""
     ttft_s = first_token_time - start_time
@@ -250,21 +476,34 @@ def _compute_single_metrics(
     )
     e2e_duration = end_time - start_time
 
-    ttft_ms = ttft_s * 1000
+    ttft_ms: float | None = ttft_s * 1000
     if generation_measured and completion_tokens > 1 and gen_duration > 0:
-        tpot_ms = (gen_duration / (completion_tokens - 1)) * 1000
-        gen_tps = completion_tokens / gen_duration
+        tpot_ms: float | None = (gen_duration / (completion_tokens - 1)) * 1000
+        gen_tps: float | None = completion_tokens / gen_duration
     else:
-        tpot_ms = 0.0
-        gen_tps = 0.0
-    processing_tps = prompt_tokens / max(prefill_duration, 1e-9)
+        # Generation timing could not be measured (e.g. all content arrived
+        # in a single burst with no measurable inter-token span) — report
+        # unmeasured rather than a misleading 0.0.
+        tpot_ms = None
+        gen_tps = None
+    processing_tps: float | None = prompt_tokens / max(prefill_duration, 1e-9)
     total_throughput = (prompt_tokens + completion_tokens) / max(e2e_duration, 1e-9)
 
+    if not timing_observed:
+        # The first-token timestamp was never observed and fell back to the
+        # end of the response, so TTFT covers the whole response and the
+        # prefill rate derived from it is not a prefill rate at all. Only
+        # e2e latency and total throughput survive.
+        ttft_ms = None
+        processing_tps = None
+
     return {
-        "ttft_ms": round(ttft_ms, 1),
-        "tpot_ms": round(tpot_ms, 2),
-        "gen_tps": round(gen_tps, 1),
-        "processing_tps": round(processing_tps, 1),
+        "ttft_ms": round(ttft_ms, 1) if ttft_ms is not None else None,
+        "tpot_ms": round(tpot_ms, 2) if tpot_ms is not None else None,
+        "gen_tps": round(gen_tps, 1) if gen_tps is not None else None,
+        "processing_tps": (
+            round(processing_tps, 1) if processing_tps is not None else None
+        ),
         "e2e_latency_s": round(e2e_duration, 3),
         "total_throughput": round(total_throughput, 1),
         "peak_memory_bytes": peak_memory,
@@ -272,6 +511,33 @@ def _compute_single_metrics(
         "completion_tokens": completion_tokens,
         "cached_tokens": cached_tokens,
     }
+
+
+def _pin_speed_priority(engine_pool: Any) -> bool | None:
+    """Force prefill speed priority for the benchmark's duration.
+
+    Throughput numbers measured while the memory-guard throttle shrinks
+    prefill chunks are not comparable, so the bench always runs in speed
+    mode. The pin lands on the pool's stored scheduler config — the bench
+    model is loaded fresh after unload-all, so that is where its Scheduler
+    reads the flag from. Returns the previous value for restoration, or
+    None when the pool exposes no config (nothing to restore).
+    """
+    config = getattr(engine_pool, "_scheduler_config", None)
+    if config is None:
+        return None
+    previous = bool(getattr(config, "prefill_speed_priority", False))
+    config.prefill_speed_priority = True
+    return previous
+
+
+def _restore_speed_priority(engine_pool: Any, previous: bool | None) -> None:
+    """Undo _pin_speed_priority (no-op when the pin never landed)."""
+    if previous is None:
+        return
+    config = getattr(engine_pool, "_scheduler_config", None)
+    if config is not None:
+        config.prefill_speed_priority = previous
 
 
 def _get_batch_benchmark_core(engine: Any) -> Any | None:
@@ -301,11 +567,17 @@ async def _send_event(run: BenchmarkRun, event: dict) -> None:
 
 async def _run_single_test(
     engine: Any,
-    prompt: str,
+    prompt: list[int],
     max_tokens: int,
     pp_len: int,
 ) -> dict:
     """Run a single request benchmark test and return metrics."""
+    if len(prompt) != pp_len:
+        raise RuntimeError(
+            f"Benchmark prompt length mismatch before pp{pp_len}: "
+            f"built {len(prompt)} tokens"
+        )
+
     # Reset peak memory tracking
     try:
         mx.reset_peak_memory()
@@ -354,9 +626,18 @@ async def _run_single_test(
     except Exception:
         peak_memory = 0
 
-    prompt_tokens = last_output.prompt_tokens if last_output else 0
-    completion_tokens = last_output.completion_tokens if last_output else 0
-    cached_tokens = last_output.cached_tokens if last_output else 0
+    if last_output is None:
+        raise RuntimeError(f"Benchmark pp{pp_len} produced no engine output")
+
+    prompt_tokens = last_output.prompt_tokens
+    if prompt_tokens != pp_len:
+        raise RuntimeError(
+            f"Benchmark prompt length mismatch after pp{pp_len}: "
+            f"engine reported {prompt_tokens} tokens"
+        )
+
+    completion_tokens = last_output.completion_tokens
+    cached_tokens = last_output.cached_tokens
 
     if cached_tokens > 0:
         logger.warning(
@@ -408,7 +689,7 @@ async def _run_single_test(
 
 async def _run_batch_test(
     engine: Any,
-    prompts: list[str],
+    prompts: list[list[int]],
     prompt_tokens: int,
     max_tokens: int,
     batch_size: int,
@@ -429,6 +710,20 @@ async def _run_batch_test(
     engine_core = _get_batch_benchmark_core(engine)
     if engine_core is None:
         raise ValueError("Engine does not support batch benchmarks")
+    if len(prompts) < batch_size:
+        raise RuntimeError(
+            f"Benchmark batch requires {batch_size} prompts, got {len(prompts)}"
+        )
+    invalid_lengths = [
+        len(prompt)
+        for prompt in prompts[:batch_size]
+        if len(prompt) != prompt_tokens
+    ]
+    if invalid_lengths:
+        raise RuntimeError(
+            f"Benchmark batch prompt length mismatch: expected {prompt_tokens}, "
+            f"got {invalid_lengths}"
+        )
 
     sampling_params = SamplingParams(
         max_tokens=max_tokens,
@@ -436,12 +731,13 @@ async def _run_batch_test(
         top_p=1.0,
     )
 
-    async def _single_request(prompt: str) -> dict:
+    async def _single_request(prompt: list[int]) -> dict:
         """Run a single request within the batch."""
         start = time.perf_counter()
         first_token = None
         tokens = 0
         prev_tokens = 0
+        reported_prompt_tokens = 0
 
         request_id = await engine_core.add_request(
             prompt=prompt,
@@ -454,10 +750,17 @@ async def _run_batch_test(
             prev_tokens = output.completion_tokens
             if output.finished:
                 tokens = output.completion_tokens
+                reported_prompt_tokens = output.prompt_tokens
 
         end = time.perf_counter()
         if first_token is None:
             first_token = end
+        if reported_prompt_tokens != prompt_tokens:
+            raise RuntimeError(
+                f"Benchmark batch prompt length mismatch after submission: "
+                f"expected {prompt_tokens}, engine reported "
+                f"{reported_prompt_tokens}"
+            )
 
         return {
             "ttft_s": first_token - start,
@@ -466,12 +769,24 @@ async def _run_batch_test(
             "completion_tokens": tokens,
         }
 
-    # Submit all requests concurrently
+    # Submit all requests concurrently. Nothing else generates during the
+    # gather, so the process-global peak counter belongs to this batch.
+    if HAS_MLX:
+        try:
+            mx.reset_peak_memory()
+        except Exception:
+            pass
     wall_start = time.perf_counter()
     results = await asyncio.gather(
         *[_single_request(prompts[i]) for i in range(batch_size)]
     )
     wall_end = time.perf_counter()
+    peak_memory = 0
+    if HAS_MLX:
+        try:
+            peak_memory = mx.get_peak_memory()
+        except Exception:
+            peak_memory = 0
 
     # Aggregate metrics
     total_gen_tokens = sum(r["completion_tokens"] for r in results)
@@ -494,6 +809,7 @@ async def _run_batch_test(
         "tg_tps": round(tg_tps, 1),
         "avg_ttft_ms": round(avg_ttft_ms, 1),
         "e2e_latency_s": round(wall_time, 3),
+        "peak_memory_bytes": peak_memory,
         "total_gen_tokens": total_gen_tokens,
         "batch_size": batch_size,
     }
@@ -529,6 +845,7 @@ async def _run_external_single_test(
         prefill_duration_s=None,
         generation_duration_s=gen_duration if gen_duration > 0 else None,
         generation_measured=gen_duration > 0,
+        timing_observed=stats.content_observed,
     )
     metrics["peak_memory_bytes"] = None
     return metrics
@@ -557,36 +874,57 @@ async def _run_external_batch_test(
     wall_end = time.perf_counter()
 
     total_gen_tokens = sum(s.completion_tokens for s in stats_list)
-    total_prompt_tokens = sum(s.prompt_tokens for s in stats_list)
+    prompt_tokens_per_request = [s.prompt_tokens for s in stats_list]
+    total_prompt_tokens = sum(prompt_tokens_per_request)
     wall_time = wall_end - wall_start
-    avg_ttft_ms = (
-        sum(s.first_content_time - s.start_time for s in stats_list) / batch_size
-    ) * 1000
 
-    # pp TPS: total prompt tokens / time until ALL requests emit content
+    # Every aggregate below is derived from the per-request content
+    # timestamps, so a single stream that never reported content poisons all
+    # of them: its fallback timestamp sits at the end of the response and
+    # drags max_first_token along with it.
+    timing_observed = all(s.content_observed for s in stats_list)
+    decode_observed = all(
+        s.last_content_time > s.first_content_time for s in stats_list
+    )
+
     max_first_token = max(s.first_content_time for s in stats_list)
-    pp_tps = total_prompt_tokens / max(max_first_token - wall_start, 1e-9)
+    gen_window = wall_end - max_first_token
 
-    # tg TPS: total generated tokens / generation wall time
-    tg_tps = total_gen_tokens / max(wall_end - max_first_token, 1e-9)
+    avg_ttft_ms: float | None = None
+    pp_tps: float | None = None
+    tg_tps: float | None = None
+    if timing_observed:
+        total_ttft_s = sum(s.first_content_time - s.start_time for s in stats_list)
+        avg_ttft_ms = round((total_ttft_s / batch_size) * 1000, 1)
+        # pp TPS: total prompt tokens / time until ALL requests emit content
+        prefill_window = max(max_first_token - wall_start, 1e-9)
+        pp_tps = round(total_prompt_tokens / prefill_window, 1)
+        # tg TPS needs a real decode span. wall_end is sampled after
+        # asyncio.gather returns, so gen_window stays positive even when
+        # every per-request timestamp collapsed onto the end of the
+        # response, and the window alone cannot tell a genuine decode phase
+        # from a single-chunk dump.
+        if decode_observed and gen_window > 0:
+            tg_tps = round(total_gen_tokens / gen_window, 1)
 
     return {
-        "pp_tps": round(pp_tps, 1),
-        "tg_tps": round(tg_tps, 1),
-        "avg_ttft_ms": round(avg_ttft_ms, 1),
+        "pp_tps": pp_tps,
+        "tg_tps": tg_tps,
+        "avg_ttft_ms": avg_ttft_ms,
         "e2e_latency_s": round(wall_time, 3),
         "total_gen_tokens": total_gen_tokens,
+        "total_prompt_tokens": total_prompt_tokens,
+        "prompt_tokens": round(total_prompt_tokens / batch_size),
+        "prompt_tokens_min": min(prompt_tokens_per_request),
+        "prompt_tokens_max": max(prompt_tokens_per_request),
         "batch_size": batch_size,
     }
 
 
 OMLX_AI_API_URL = "https://omlx.ai/api/benchmarks"
 
-# Quantization patterns to strip from model directory names
-_QUANT_SUFFIXES = re.compile(
-    r"[-_](2bit|3bit|4bit|6bit|8bit|fp16|bf16|fp32|MXFP4|NVFP4)$", re.IGNORECASE
-)
-_MLX_SUFFIXES = re.compile(r"[-_]?MLX[-_]?", re.IGNORECASE)
+# The leaderboard accepts model_name up to 150 characters.
+_MAX_MODEL_NAME_LEN = 150
 
 
 def _detect_quantization(model_path: str) -> str:
@@ -617,16 +955,16 @@ def _detect_quantization(model_path: str) -> str:
     return "unknown"
 
 
-def _clean_model_name(model_id: str, quantization: str) -> str:
-    """Clean model directory name for display as model_name.
+def _upload_model_name(model_id: str) -> str:
+    """Model name to publish: exactly what oMLX shows and its copy button copies.
 
-    Strips quantization suffixes and MLX markers.
-    e.g. "Qwen3-30B-A3B-4bit" → "Qwen3-30B-A3B"
+    Quantization and MLX suffixes used to be stripped here, which lost the one
+    detail that distinguishes two builds of the same model on the leaderboard.
+    The trailing path component is taken defensively — discovery registers ids
+    as a single path component today, so this is a no-op for local runs.
     """
-    name = model_id
-    name = _QUANT_SUFFIXES.sub("", name)
-    name = _MLX_SUFFIXES.sub("", name)
-    return name.strip("-_ ")
+    name = model_id.rstrip("/").split("/")[-1]
+    return name[:_MAX_MODEL_NAME_LEN]
 
 
 def _sanitize_upload_error(resp: Any) -> str:
@@ -694,23 +1032,15 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
         parse_chip_info,
     )
 
-    # Skip upload when experimental features were active during the run.
-    # These features skew throughput and would pollute the community
-    # leaderboard if mixed in unmarked.
-    if run.experimental_features:
-        run.upload_state["phase"] = "skipped"
-        run.upload_state["skipped_reason"] = "experimental_features"
-        run.upload_state["skipped_features"] = list(run.experimental_features)
-        await _send_event(run, {
-            "type": "upload_skipped",
-            "reason": "experimental_features",
-            "features": list(run.experimental_features),
-        })
+    # Accelerated runs upload too. They carry their flags so the leaderboard
+    # can mark and filter them, which is more useful than withholding the one
+    # set of numbers people most want to see.
+    run.upload_state["feature_flags"] = list(run.feature_flags)
+    if run.feature_flags:
         logger.info(
-            f"Benchmark upload skipped: experimental features active: "
-            f"{run.experimental_features}"
+            "Benchmark upload tagged with acceleration flags: "
+            f"{[f['key'] for f in run.feature_flags]}"
         )
-        return
 
     run.upload_state["phase"] = "uploading"
     await _send_event(run, {
@@ -742,10 +1072,25 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
     entry = engine_pool.get_entry(run.request.model_id)
     model_path = entry.model_path if entry else ""
     quantization = _detect_quantization(model_path)
-    model_name = _clean_model_name(run.request.model_id, quantization)
+    model_name = _upload_model_name(run.request.model_id)
 
     # Generate submission group
     submission_group = str(uuid.uuid4())
+
+    # Peak process memory for the run. ri_lifetime_max_phys_footprint is a
+    # high-water mark since process start, so it only describes this benchmark
+    # when the benchmark actually set a new maximum — a server that previously
+    # held a larger model would otherwise report that older peak. Fall back to
+    # the sampler's own maximum, which is scoped to the run.
+    peak_footprint_gb = None
+    lifetime_end = get_lifetime_max_phys_footprint()
+    peak_bytes = 0
+    if lifetime_end and lifetime_end > run.lifetime_footprint_at_start:
+        peak_bytes = lifetime_end
+    elif run.sampler is not None:
+        peak_bytes = run.sampler.run_peak_footprint()
+    if peak_bytes > 0:
+        peak_footprint_gb = round(peak_bytes / (1024**3), 2)
 
     # Collect single results and batch results
     single_results = [r for r in run.results if r.get("test_type") == "single"]
@@ -809,6 +1154,13 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
             "ttft_ms": result.get("ttft_ms"),
             "peak_memory_gb": peak_mem_gb,
             "submission_group": submission_group,
+            "peak_footprint_gb": peak_footprint_gb,
+            "feature_flags": run.feature_flags,
+            "model_settings": run.model_settings_snapshot,
+            # Per-row: each context length has its own load window. Stays None
+            # when sampling was unavailable, so the site does not average
+            # fabricated zeros in as measurements.
+            "system_metrics": result.get("system_metrics"),
         }
 
         if owner_hash_full:
@@ -908,6 +1260,9 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
             "success": success_count,
             "failed": failed_count,
             "skipped": skipped_count,
+            # Also on the event so SSE-only consumers (the HTML dashboard) get
+            # the flags without polling /results.
+            "feature_flags": run.feature_flags,
         },
     })
 
@@ -935,6 +1290,10 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
     current_test = 0
     overall_start = time.perf_counter()
 
+    # Throughput measurements must not be skewed by the memory-guard
+    # throttle shrinking chunks; pin speed priority for the run.
+    previous_speed_priority = _pin_speed_priority(engine_pool)
+
     try:
         # Snapshot experimental flags at run start. Settings can change mid-run,
         # and the produced numbers are tied to whatever was active when
@@ -947,6 +1306,8 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 run.experimental_features.extend(
                     _detect_experimental_features(model_settings)
                 )
+                run.feature_flags = _derive_feature_flags(model_settings)
+                run.model_settings_snapshot = _filter_uploaded_settings(model_settings)
             except Exception as e:
                 logger.warning(
                     f"Benchmark: failed to read experimental flags for "
@@ -994,7 +1355,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
 
         # Generate prompts for all needed lengths
         tokenizer = engine.tokenizer
-        prompts: dict[int, str] = {}
+        prompts: dict[int, list[int]] = {}
         for pp_len in request.prompt_lengths:
             prompts[pp_len] = _generate_prompt(tokenizer, pp_len)
 
@@ -1025,6 +1386,16 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             pass
         logger.info("Benchmark: warmup complete")
 
+        # Start host sampling after warmup: Metal shader and JIT compilation
+        # would otherwise be folded into the CPU aggregates.
+        run.lifetime_footprint_at_start = get_lifetime_max_phys_footprint()
+        try:
+            run.sampler = SystemSampler()
+            run.sampler.start()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Benchmark: host sampling unavailable: {e}")
+            run.sampler = None
+
         # Phase 3: Single request tests
         single_pp1024_gen_tps = None
 
@@ -1038,12 +1409,16 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 "total": total_tests,
             })
 
+            # time.monotonic only — the test internals use perf_counter, and
+            # the two clocks have different epochs.
+            window_start = time.monotonic()
             metrics = await _run_single_test(
                 engine=engine,
                 prompt=prompts[pp_len],
                 max_tokens=request.generation_length,
                 pp_len=pp_len,
             )
+            metrics["system_metrics"] = _sample_window(run, window_start)
 
             result = {
                 "test_type": "single",
@@ -1082,6 +1457,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 "total": total_tests,
             })
 
+            window_start = time.monotonic()
             batch_metrics = await _run_batch_test(
                 engine=engine,
                 prompts=batch_prompts[:batch_size],
@@ -1089,6 +1465,7 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
                 max_tokens=request.generation_length,
                 batch_size=batch_size,
             )
+            batch_metrics["system_metrics"] = _sample_window(run, window_start)
 
             result = {
                 "test_type": "batch",
@@ -1167,6 +1544,14 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         except Exception:
             pass
 
+    finally:
+        if run.sampler is not None:
+            try:
+                run.sampler.stop()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Benchmark: sampler stop failed: {e}")
+        _restore_speed_priority(engine_pool, previous_speed_priority)
+
 
 async def _run_external_benchmark(run: BenchmarkRun) -> None:
     """Execute a benchmark run against an external OpenAI-compatible endpoint.
@@ -1217,7 +1602,8 @@ async def _run_external_benchmark(run: BenchmarkRun) -> None:
 
             result = {
                 "test_type": "single",
-                "pp": pp_len,
+                "pp": metrics["prompt_tokens"],
+                "requested_pp": pp_len,
                 "tg": request.generation_length,
                 **metrics,
             }
@@ -1244,7 +1630,8 @@ async def _run_external_benchmark(run: BenchmarkRun) -> None:
 
             result = {
                 "test_type": "batch",
-                "pp": 1024,
+                "pp": batch_metrics["prompt_tokens"],
+                "requested_pp": 1024,
                 "tg": request.generation_length,
                 **batch_metrics,
             }
