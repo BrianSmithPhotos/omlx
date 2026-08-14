@@ -51,6 +51,7 @@ class TestServerSettings:
         assert settings.auto_start_on_launch is True
         assert settings.burst_decode_mode == "balanced"
         assert settings.preserve_mid_system_cache is True
+        assert settings.distributed_inference_enabled is False
 
     def test_custom_values(self):
         """Test custom values."""
@@ -79,7 +80,17 @@ class TestServerSettings:
             "auto_start_on_launch": True,
             "burst_decode_mode": "balanced",
             "preserve_mid_system_cache": True,
+            "distributed_inference_enabled": False,
         }
+
+    def test_from_dict_distributed_inference_is_opt_in(self):
+        assert ServerSettings.from_dict({}).distributed_inference_enabled is False
+        assert (
+            ServerSettings.from_dict(
+                {"distributed_inference_enabled": True}
+            ).distributed_inference_enabled
+            is True
+        )
 
     def test_from_dict_sse_keepalive_mode(self):
         """sse_keepalive_mode round-trips through from_dict / to_dict."""
@@ -323,7 +334,18 @@ class TestSchedulerSettings:
             "embedding_batch_size": 32,
             "chunked_prefill": False,
             "prefill_priority": "context",
+            "decode_fairness": True,
         }
+
+    def test_decode_fairness_from_dict(self):
+        """Defaults on; explicit false round-trips."""
+        assert SchedulerSettings.from_dict({}).decode_fairness is True
+        assert (
+            SchedulerSettings.from_dict(
+                {"decode_fairness": False}
+            ).decode_fairness
+            is False
+        )
 
     def test_prefill_priority_from_dict(self):
         """Valid values pass through; anything else falls back to context."""
@@ -406,6 +428,8 @@ class TestCacheSettings:
         assert result == {
             "enabled": False,
             "hot_cache_only": False,
+            "gdn_ssd_split_enabled": False,
+            "gdn_ssd_pending_max_size": "512MB",
             "ssd_cache_dir": "/cache",
             "ssd_cache_max_size": "50GB",
             "hot_cache_max_size": "0",
@@ -2187,6 +2211,38 @@ class TestIntegrationSettings:
         assert "markitdown_max_file_size_mb must be > 0" in errors
         assert "markitdown_max_files_per_request must be > 0" in errors
         assert "markitdown_pdf_processing_engine must not be empty" in errors
+
+    def test_web_search_defaults(self):
+        settings = IntegrationSettings()
+        assert settings.web_search_provider == "ddgs"
+        assert settings.web_search_brave_api_key == ""
+        assert settings.web_search_searxng_url == ""
+        assert settings.web_search_ddgs_backends == ""
+        assert settings.web_search_max_results == 3
+        assert settings.web_search_content_mode == "snippet"
+        assert settings.web_search_content_truncate is True
+        assert settings.web_search_content_max_chars == 20000
+
+    def test_web_search_round_trip(self):
+        settings = IntegrationSettings(
+            web_search_provider="ddgs_custom",
+            web_search_brave_api_key="key123",
+            web_search_searxng_url="http://searx.local:8080",
+            web_search_ddgs_backends="yahoo,mojeek",
+            web_search_max_results=7,
+            web_search_content_mode="full",
+            web_search_content_truncate=False,
+            web_search_content_max_chars=5000,
+        )
+        round_tripped = IntegrationSettings.from_dict(settings.to_dict())
+        assert round_tripped.to_dict() == settings.to_dict()
+
+    def test_web_search_from_dict_backward_compat(self):
+        settings = IntegrationSettings.from_dict({})
+        assert settings.web_search_provider == "ddgs"
+        assert settings.web_search_ddgs_backends == ""
+        assert settings.web_search_max_results == 3
+        assert settings.web_search_content_mode == "snippet"
 
 
 class TestClaudeCodeValidation:

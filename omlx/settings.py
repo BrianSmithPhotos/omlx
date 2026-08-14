@@ -175,6 +175,7 @@ class ServerSettings:
     auto_start_on_launch: bool = True
     burst_decode_mode: str = DEFAULT_BURST_DECODE_MODE
     preserve_mid_system_cache: bool = True
+    distributed_inference_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -194,6 +195,10 @@ class ServerSettings:
             auto_start_on_launch=data.get("auto_start_on_launch", True),
             burst_decode_mode=data.get("burst_decode_mode", DEFAULT_BURST_DECODE_MODE),
             preserve_mid_system_cache=data.get("preserve_mid_system_cache", True),
+            distributed_inference_enabled=data.get(
+                "distributed_inference_enabled",
+                False,
+            ),
         )
 
 
@@ -275,6 +280,11 @@ class SchedulerSettings:
     #   "speed" — never shrink; keep full-size steps and only admit prompts
     #     that fit at full speed (smaller effective context limit).
     prefill_priority: str = "context"
+    # When True (default), prefill yields GPU time to running decodes:
+    # prompts are force-chunked under contention, chunks are capped while
+    # any engine decodes, and each chunk accrues a decode time debt repaid
+    # before the next chunk runs. Off restores the pre-fairness behavior.
+    decode_fairness: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -300,6 +310,7 @@ class SchedulerSettings:
             embedding_batch_size=embedding_batch_size,
             chunked_prefill=bool(data.get("chunked_prefill", False)),
             prefill_priority=prefill_priority,
+            decode_fairness=bool(data.get("decode_fairness", True)),
         )
 
 
@@ -313,6 +324,8 @@ class CacheSettings:
     ssd_cache_max_size: str = "auto"  # "auto" means 10% of SSD capacity
     hot_cache_max_size: str = "0"  # "0" = disabled, e.g. "8GB"
     initial_cache_blocks: int = 256  # Starting blocks (grows dynamically)
+    gdn_ssd_split_enabled: bool = False
+    gdn_ssd_pending_max_size: str = "512MB"
 
     def get_ssd_cache_dir(self, base_path: Path) -> Path:
         """
@@ -352,6 +365,8 @@ class CacheSettings:
         return {
             "enabled": self.enabled,
             "hot_cache_only": self.hot_cache_only,
+            "gdn_ssd_split_enabled": self.gdn_ssd_split_enabled,
+            "gdn_ssd_pending_max_size": self.gdn_ssd_pending_max_size,
             "ssd_cache_dir": self.ssd_cache_dir,
             "ssd_cache_max_size": self.ssd_cache_max_size,
             "hot_cache_max_size": self.hot_cache_max_size,
@@ -368,6 +383,10 @@ class CacheSettings:
         return cls(
             enabled=data.get("enabled", True),
             hot_cache_only=data.get("hot_cache_only", False),
+            gdn_ssd_split_enabled=data.get("gdn_ssd_split_enabled", False),
+            gdn_ssd_pending_max_size=data.get(
+                "gdn_ssd_pending_max_size", "512MB"
+            ),
             ssd_cache_dir=data.get("ssd_cache_dir"),
             ssd_cache_max_size=data.get("ssd_cache_max_size", "auto"),
             hot_cache_max_size=hot_cache_max_size,
@@ -757,6 +776,15 @@ class IntegrationSettings:
     markitdown_max_file_size_mb: int = 25
     markitdown_max_files_per_request: int = 5
     markitdown_pdf_processing_engine: str = "markitdown"
+    # "ddgs" (all engines) | "ddgs_custom" | "duckduckgo" | "brave" | "searxng"
+    web_search_provider: str = "ddgs"
+    web_search_brave_api_key: str = ""
+    web_search_searxng_url: str = ""
+    web_search_ddgs_backends: str = ""  # comma-separated, used by ddgs_custom
+    web_search_max_results: int = 3  # 1..10
+    web_search_content_mode: str = "snippet"  # "snippet" | "full"
+    web_search_content_truncate: bool = True
+    web_search_content_max_chars: int = 20000
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -773,6 +801,14 @@ class IntegrationSettings:
             "markitdown_max_file_size_mb": self.markitdown_max_file_size_mb,
             "markitdown_max_files_per_request": self.markitdown_max_files_per_request,
             "markitdown_pdf_processing_engine": self.markitdown_pdf_processing_engine,
+            "web_search_provider": self.web_search_provider,
+            "web_search_brave_api_key": self.web_search_brave_api_key,
+            "web_search_searxng_url": self.web_search_searxng_url,
+            "web_search_ddgs_backends": self.web_search_ddgs_backends,
+            "web_search_max_results": self.web_search_max_results,
+            "web_search_content_mode": self.web_search_content_mode,
+            "web_search_content_truncate": self.web_search_content_truncate,
+            "web_search_content_max_chars": self.web_search_content_max_chars,
         }
 
     @classmethod
@@ -794,6 +830,18 @@ class IntegrationSettings:
             ),
             markitdown_pdf_processing_engine=data.get(
                 "markitdown_pdf_processing_engine", "markitdown"
+            ),
+            web_search_provider=data.get("web_search_provider", "ddgs"),
+            web_search_brave_api_key=data.get("web_search_brave_api_key", ""),
+            web_search_searxng_url=data.get("web_search_searxng_url", ""),
+            web_search_ddgs_backends=data.get("web_search_ddgs_backends", ""),
+            web_search_max_results=data.get("web_search_max_results", 3),
+            web_search_content_mode=data.get("web_search_content_mode", "snippet"),
+            web_search_content_truncate=data.get(
+                "web_search_content_truncate", True
+            ),
+            web_search_content_max_chars=data.get(
+                "web_search_content_max_chars", 20000
             ),
         )
 
@@ -982,6 +1030,14 @@ class GlobalSettings:
             self.cache.ssd_cache_max_size = ssd_cache_max
         if hot_cache_only := os.getenv("OMLX_HOT_CACHE_ONLY"):
             self.cache.hot_cache_only = hot_cache_only.lower() in ("true", "1", "yes")
+        if gdn_ssd_split := os.getenv("OMLX_GDN_SSD_SPLIT_ENABLED"):
+            self.cache.gdn_ssd_split_enabled = gdn_ssd_split.lower() in (
+                "true",
+                "1",
+                "yes",
+            )
+        if gdn_ssd_pending_max := os.getenv("OMLX_GDN_SSD_PENDING_MAX_SIZE"):
+            self.cache.gdn_ssd_pending_max_size = gdn_ssd_pending_max
         if initial_blocks := os.getenv("OMLX_INITIAL_CACHE_BLOCKS"):
             try:
                 self.cache.initial_cache_blocks = int(initial_blocks)
@@ -1355,6 +1411,18 @@ class GlobalSettings:
             )
 
         # Cache validation
+        if self.cache.gdn_ssd_split_enabled and self.cache.hot_cache_only:
+            errors.append(
+                "gdn_ssd_split_enabled cannot be used with hot_cache_only"
+            )
+
+        try:
+            gdn_pending_size = parse_size(self.cache.gdn_ssd_pending_max_size)
+            if gdn_pending_size <= 0:
+                errors.append("gdn_ssd_pending_max_size must be positive")
+        except (AttributeError, TypeError, ValueError) as e:
+            errors.append(f"Invalid gdn_ssd_pending_max_size: {e}")
+
         if self.cache.ssd_cache_max_size.lower() != "auto":
             try:
                 size = parse_size(self.cache.ssd_cache_max_size)
@@ -1483,6 +1551,7 @@ class GlobalSettings:
             embedding_batch_size=self.scheduler.embedding_batch_size,
             chunked_prefill=self.scheduler.chunked_prefill,
             prefill_speed_priority=(self.scheduler.prefill_priority == "speed"),
+            decode_fairness=self.scheduler.decode_fairness,
             initial_cache_blocks=self.cache.initial_cache_blocks,
             paged_ssd_cache_dir=str(ssd_dir) if ssd_dir else None,
             hot_cache_only=self.cache.hot_cache_only,
@@ -1490,6 +1559,10 @@ class GlobalSettings:
                 self.base_path
             ),
             hot_cache_max_size=self.cache.get_hot_cache_max_size_bytes(),
+            gdn_ssd_split_enabled=self.cache.gdn_ssd_split_enabled,
+            gdn_ssd_pending_max_bytes=parse_size(
+                self.cache.gdn_ssd_pending_max_size
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:

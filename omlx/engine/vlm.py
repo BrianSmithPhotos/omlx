@@ -56,6 +56,7 @@ from .base import (
     BaseEngine,
     GenerationOutput,
     _clear_teardown_references,
+    _run_scheduler_preflight_with_cleanup_retry,
     _warn_scheduler_unreachable_once,
 )
 
@@ -1314,19 +1315,16 @@ class VLMBatchedEngine(BaseEngine):
         num_prompt_tokens: int,
         request_id: str | None,
     ) -> None:
-        eviction_request = scheduler.preflight_eviction_request(
+        await _run_scheduler_preflight_with_cleanup_retry(
+            scheduler,
             num_prompt_tokens=num_prompt_tokens,
             request_id=request_id,
-        )
-        if eviction_request is not None and self._prefill_eviction_callback is not None:
-            logger.info(
-                "Running preflight LRU eviction for request %s",
-                eviction_request.request_id,
-            )
-            await self._prefill_eviction_callback(eviction_request)
-        scheduler.preflight_or_raise(
-            num_prompt_tokens=num_prompt_tokens,
-            request_id=request_id,
+            eviction_callback=self._prefill_eviction_callback,
+            executor=getattr(
+                getattr(getattr(self, "_engine", None), "engine", None),
+                "_mlx_executor",
+                None,
+            ),
         )
 
     @property
@@ -1771,12 +1769,17 @@ class VLMBatchedEngine(BaseEngine):
         ):
             try:
                 from ..patches.qwen35_q4_mlp import (
+                    apply_muse_glimmer_q4_prefill_patch,
                     apply_qwen35_q4_mlp_patch,
                     apply_qwen35_q4_prefill_linear_patch,
                 )
 
                 apply_qwen35_q4_mlp_patch()
                 apply_qwen35_q4_prefill_linear_patch()
+                # Muse Glimmer rides the same native qmm tile (MLP plus the
+                # q/gate/o attention projections); no-op unless the muse
+                # compat patch installed the vendored module.
+                apply_muse_glimmer_q4_prefill_patch()
             except Exception:
                 logger.debug("Qwen q4 MLP prefill patch not applied", exc_info=True)
 
@@ -1973,6 +1976,21 @@ class VLMBatchedEngine(BaseEngine):
         """
         chat_template = getattr(tokenizer, "chat_template", None)
         if not chat_template:
+            return
+
+        # MiniMax M3's template contains generic <tool_call> text in comments
+        # and examples, so upstream inference incorrectly selects json_tools.
+        # Use the same oMLX protocol adapter as distributed ranks.
+        from ..adapter.output_parser import (
+            install_minimax_m3_tokenizer_protocol,
+        )
+
+        if install_minimax_m3_tokenizer_protocol(
+            tokenizer,
+            self._model_name,
+            {"model_type": self.model_type} if self.model_type else None,
+        ):
+            logger.info("VLM tool calling enabled: parser=minimax_m3")
             return
 
         # Prefer mlx_vlm.tool_parsers (superset; knows about Gemma4 etc.)

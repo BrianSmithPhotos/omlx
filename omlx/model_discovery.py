@@ -67,6 +67,7 @@ VLM_MODEL_TYPES = {
     "youtu_vl",
     "inkling",
     "inkling_mm_model",  # config model_type of Inkling Small checkpoints
+    "muse_glimmer",
 }
 
 # Text-only model families that are implemented in mlx-vlm rather than
@@ -160,6 +161,7 @@ VLM_ARCHITECTURES = {
     "Florence2ForConditionalGeneration",
     "UnlimitedOCRForCausalLM",  # baidu/Unlimited-OCR
     "InklingForConditionalGeneration",  # thinkingmachines/Inkling-Small
+    "MuseGlimmerForConditionalGeneration",  # meta-models/Muse-Glimmer-30B
 }
 
 # Known embedding model types from mlx-embeddings
@@ -347,6 +349,19 @@ AUDIO_STS_ARCHITECTURES = {
     "SAMAudio",
     "LFM2AudioModel",
 }
+
+# STT families whose mlx-audio implementations accept incremental audio
+# input (push-based realtime decoding): whisper via the AlignAtt
+# StreamingDecoder, voxtral_realtime via VoxtralStreamingSession. Gates
+# the realtime transcription WebSocket and the admin chat mic button.
+REALTIME_STT_MODEL_TYPES = {"whisper", "voxtral_realtime"}
+
+
+def is_realtime_stt_model(model_type: str, config_model_type: str) -> bool:
+    """True when an audio_stt model supports push-based realtime decoding."""
+    if model_type != "audio_stt":
+        return False
+    return (config_model_type or "").lower() in REALTIME_STT_MODEL_TYPES
 
 
 @dataclass
