@@ -33,11 +33,16 @@ from pydantic import BaseModel, Field, field_validator
 from ..api.markitdown import MARKITDOWN_MODEL_ID, markitdown_model_visible
 from ..api.openai_models import _coerce_tool_call_arguments
 from ..api.utils import _try_parse_json
+from ..model_discovery import model_display_name as _model_display_name
 from ..model_profiles import EXCLUDED_FROM_PROFILES
 from ..model_settings import merge_chat_template_kwargs
 from ..settings import BURST_DECODE_MODES, SubKeyEntry, burst_decode_env
 from ..utils.release_check import normalize_update_channel, select_latest_release
-from ..websearch import DDGS_TEXT_BACKENDS, run_web_search_test
+from ..websearch import (
+    DDGS_TEXT_BACKENDS,
+    DEFAULT_MAX_RESULTS,
+    run_web_search_test,
+)
 from ..websearch import SUPPORTED_PROVIDERS as SUPPORTED_WEB_SEARCH_PROVIDERS
 from .auth import (
     REMEMBER_ME_MAX_AGE,
@@ -136,11 +141,29 @@ class ModelSettingsRequest(BaseModel):
     ttl_seconds: int | None = None
     index_cache_freq: int | None = None
     enable_thinking: bool | None = None
+    qwen4_ple_ssd_offload: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_bits: float | None = None
+    # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill
+    qwen35_ane_prefill_enabled: bool | None = None
+    qwen35_ane_prefill_sequence_length: int | None = None
+    qwen35_ane_prefill_tail_padding_min_tokens: int | None = None
+    qwen35_ane_prefill_fraction: float | None = None
+    qwen35_ane_prefill_fused_down: bool | None = None
+    qwen35_ane_prefill_max_layers: int | None = None
+    qwen35_ane_prefill_dual_ane: bool | None = None
+    qwen35_ane_prefill_gdn: bool | None = None
+    qwen35_ane_prefill_gdn_fraction: float | None = None
+    qwen35_ane_prefill_gdn_max_layers: int | None = None
+    qwen35_ane_prefill_cpu_enabled: bool | None = None
+    qwen35_ane_prefill_cpu_fraction: float | None = None
+    qwen35_ane_prefill_cpu_down_fraction: float | None = None
+    qwen35_ane_prefill_cpu_gdn_fraction: float | None = None
+    qwen35_ane_prefill_cpu_threads: int | None = None
+    qwen35_ane_prefill_cpu_shared_resource: bool | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -161,6 +184,7 @@ class ModelSettingsRequest(BaseModel):
     dflash_ssd_cache_max_bytes: int | None = None
     dflash_draft_window_size: int | None = None
     dflash_draft_sink_size: int | None = None
+    dflash_block_size: int | None = None
     dflash_verify_mode: str | None = None
     # Native MTP (mlx-lm PR 990 / PR 15 monkey-patch)
     mtp_enabled: bool | None = None
@@ -236,6 +260,7 @@ class GlobalSettingsRequest(BaseModel):
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
     distributed_inference_enabled: bool | None = None
+    max_audio_upload_size: str | None = None
 
     # Model settings
     model_dirs: list[str] | None = None
@@ -264,11 +289,18 @@ class GlobalSettingsRequest(BaseModel):
     ssd_cache_dir: str | None = None
     ssd_cache_max_size: str | None = None
     hot_cache_only: bool | None = None
+    hot_cache_write_through: bool | None = None
+    ane_compile_cache: bool | None = None
+    gdn_snapshot_storage: str | None = None
+    gdn_ssd_split_enabled: bool | None = None
+    gdn_ssd_pending_max_size: str | None = None
+    gdn_sidecar_precision: str | None = None
     hot_cache_max_size: str | None = None  # "0" = disabled, "8GB", etc.
     initial_cache_blocks: int | None = None  # Starting blocks (requires restart)
 
     # MCP settings
     mcp_config: str | None = None
+    mcp_expose_tools: bool | None = None
 
     # HuggingFace settings
     hf_endpoint: str | None = None
@@ -529,6 +561,7 @@ def _sanitize_diffusion_settings_dict(settings: dict) -> None:
         "dflash_max_ctx",
         "dflash_draft_window_size",
         "dflash_draft_sink_size",
+        "dflash_block_size",
         "dflash_verify_mode",
         "vlm_mtp_draft_model",
         "vlm_mtp_draft_block_size",
@@ -635,6 +668,7 @@ def _sanitize_diffusion_model_settings(settings) -> None:
     settings.dflash_ssd_cache_max_bytes = 20 * 1024 * 1024 * 1024
     settings.dflash_draft_window_size = None
     settings.dflash_draft_sink_size = None
+    settings.dflash_block_size = None
     settings.dflash_verify_mode = None
     settings.mtp_enabled = False
     settings.vlm_mtp_enabled = False
@@ -685,7 +719,8 @@ def _mtp_compat_for_model(model_info: dict) -> tuple[bool, str]:
     if not _is_mtp_compatible(cfg, model_type):
         return False, (
             f"model_type={model_type!r} is not on the MTP whitelist "
-            "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa)"
+            "(supported: qwen3_5*, qwen3_6*, deepseek_v4*, glm_moe_dsa, "
+            "gemma4, gemma4_unified)"
         )
     if not _checkpoint_has_mtp_weights(model_path):
         from ..oq import _resolve_mtplx_sidecar
@@ -940,6 +975,25 @@ async def _apply_cache_settings_runtime(
         return False, "Engine pool not initialized"
 
     pool = _server_state.engine_pool
+
+    # These settings all affect objects constructed with each scheduler. Keep
+    # the pool template synchronized before unloading existing engines.
+    pool._scheduler_config.hot_cache_only = global_settings.cache.hot_cache_only
+    pool._scheduler_config.hot_cache_write_through = (
+        global_settings.cache.hot_cache_write_through
+    )
+    pool._scheduler_config.gdn_ssd_split_enabled = (
+        global_settings.cache.get_gdn_ssd_split_enabled()
+    )
+    pool._scheduler_config.gdn_ssd_pending_max_bytes = parse_size(
+        global_settings.cache.gdn_ssd_pending_max_size
+    )
+    pool._scheduler_config.gdn_sidecar_state_dtype = (
+        global_settings.cache.gdn_sidecar_state_dtype
+    )
+    pool._scheduler_config.initial_cache_blocks = (
+        global_settings.cache.initial_cache_blocks
+    )
 
     # Update scheduler config based on cache settings
     if enabled is False or (enabled is None and not global_settings.cache.enabled):
@@ -1863,44 +1917,6 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
 # =============================================================================
 
 
-def _model_display_name(
-    model_id: str,
-    model_path: str | Path | None,
-    model_dirs: list[Path],
-    *,
-    source_repo_id: str | None = None,
-) -> str:
-    """Return the UI-only display name for a discovered local model."""
-    repo_id = (source_repo_id or "").strip()
-    if "/" in repo_id:
-        return repo_id
-
-    if not model_path:
-        return model_id
-
-    path_text = str(model_path)
-    if "://" in path_text:
-        return model_id
-
-    try:
-        path = Path(path_text).expanduser().resolve()
-    except (OSError, RuntimeError):
-        path = Path(path_text).expanduser()
-
-    for model_dir in model_dirs:
-        try:
-            rel = path.relative_to(model_dir.expanduser().resolve())
-        except (OSError, RuntimeError, ValueError):
-            continue
-
-        parts = rel.parts
-        if len(parts) >= 2:
-            return f"{parts[0]}/{parts[1]}"
-        return model_id
-
-    return model_id
-
-
 def _model_dirs_for_display(global_settings: Any | None) -> list[Path]:
     if global_settings is None:
         return []
@@ -1937,6 +1953,15 @@ async def list_models(is_admin: bool = Depends(require_admin)):
     # Get engine pool status
     status = engine_pool.get_status()
     models_status = status.get("models", [])
+    residency_ceiling = int(status.get("final_ceiling", 0) or 0)
+    fallback_ceiling = getattr(engine_pool, "_fallback_admission_ceiling", None)
+    if callable(fallback_ceiling):
+        try:
+            candidate = fallback_ceiling()
+            if isinstance(candidate, (int, float)) and candidate > 0:
+                residency_ceiling = int(candidate)
+        except Exception:  # noqa: BLE001
+            pass
 
     # Get all model settings
     all_settings = settings_manager.get_all_settings() if settings_manager else {}
@@ -1971,6 +1996,33 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         is_paroquant, paroquant_reason = _paroquant_compat_for_model(model_info)
         compat_ok, compat_reason = _dflash_compat_for_model(model_info)
         mtp_compat_ok, mtp_compat_reason = _mtp_compat_for_model(model_info)
+        qwen4_ple_ssd_offload_supported = False
+        qwen4_ple_ssd_offload_forced = False
+        qwen4_resident_bytes = 0
+        qwen4_mmap_bytes = 0
+        if (model_info.get("config_model_type") or "").replace(
+            "-", "_"
+        ).lower() == "qwen4_exp":
+            try:
+                from ..patches.mlx_vlm_qwen4_exp_compat.residency import (
+                    qwen4_exp_residency_estimate,
+                )
+
+                estimate = qwen4_exp_residency_estimate(
+                    model_info.get("model_path", "")
+                )
+                qwen4_ple_ssd_offload_supported = estimate.supported
+                qwen4_ple_ssd_offload_forced = estimate.force_ssd_offload(
+                    residency_ceiling
+                )
+                qwen4_resident_bytes = estimate.resident_bytes
+                qwen4_mmap_bytes = estimate.mmap_bytes
+            except (OSError, TypeError, ValueError):
+                logger.debug(
+                    "Could not inspect Qwen4-Exp PLE residency for %s",
+                    model_id,
+                    exc_info=True,
+                )
 
         model_data = {
             "id": model_id,
@@ -2021,6 +2073,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "dflash_ssd_cache_available": dflash_ssd_cache_available,
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
+            "qwen4_ple_ssd_offload_supported": qwen4_ple_ssd_offload_supported,
+            "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
+            "qwen4_ple_resident_bytes": qwen4_resident_bytes,
+            "qwen4_ple_mmap_bytes": qwen4_mmap_bytes,
             "is_paroquant": is_paroquant,
             "paroquant_reason": paroquant_reason,
         }
@@ -2090,9 +2146,22 @@ async def unload_model(
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
+    if entry.is_loading:
+        raise HTTPException(status_code=409, detail=f"Model still loading: {model_id}")
 
-    await engine_pool._unload_engine(model_id)
-    logger.info(f"Manually unloaded model: {model_id}")
+    unloaded = await engine_pool.request_unload(model_id, reason="manual admin unload")
+    if not unloaded:
+        logger.info("Queued manual unload for active model: %s", model_id)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "unloading",
+                "model_id": model_id,
+                "message": f"Aborting active requests before unloading {model_id}",
+            },
+        )
+
+    logger.info("Manually unloaded model: %s", model_id)
     return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
 
 
@@ -2332,6 +2401,13 @@ async def update_model_settings(
         )
     if "enable_thinking" in sent:
         current_settings.enable_thinking = request.enable_thinking
+    if "qwen4_ple_ssd_offload" in sent:
+        is_qwen4_exp = (entry.config_model_type or "").replace(
+            "-", "_"
+        ).lower() == "qwen4_exp"
+        current_settings.qwen4_ple_ssd_offload = bool(
+            request.qwen4_ple_ssd_offload and is_qwen4_exp
+        )
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False
@@ -2360,6 +2436,169 @@ async def update_model_settings(
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
     if "turboquant_kv_bits" in sent:
         current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+    # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill. These are all load-time
+    # controls; the runtime signature below causes a loaded model to be
+    # re-created when the user applies a changed profile.
+    if "qwen35_ane_prefill_enabled" in sent:
+        enabled = bool(request.qwen35_ane_prefill_enabled)
+        config_type = str(getattr(entry, "config_model_type", "") or "")
+        config_type = config_type.lower().replace("-", "_")
+        if enabled and not config_type.startswith(
+            ("qwen3_5", "qwen3_6", "qwen3_8")
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="ANE prefill is available only for Qwen3.5/3.6/3.8 models.",
+            )
+        current_settings.qwen35_ane_prefill_enabled = enabled
+    if "qwen35_ane_prefill_sequence_length" in sent:
+        value = request.qwen35_ane_prefill_sequence_length
+        if value is None or value < 1024 or value % 64:
+            raise HTTPException(
+                status_code=400,
+                detail="ANE prompt block must be a multiple of 64 and at least 1024.",
+            )
+        current_settings.qwen35_ane_prefill_sequence_length = int(value)
+        if (
+            current_settings.qwen35_ane_prefill_tail_padding_min_tokens
+            >= int(value)
+        ):
+            # A crossover is calibrated for one fixed program width. Changing
+            # that width invalidates it; disable padding until the next tune.
+            current_settings.qwen35_ane_prefill_tail_padding_min_tokens = 0
+    if "qwen35_ane_prefill_tail_padding_min_tokens" in sent:
+        value = request.qwen35_ane_prefill_tail_padding_min_tokens
+        sequence_length = int(current_settings.qwen35_ane_prefill_sequence_length)
+        if value is None or not 0 <= value < sequence_length:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "ANE tail padding threshold must be zero or less than the "
+                    "ANE prompt block."
+                ),
+            )
+        current_settings.qwen35_ane_prefill_tail_padding_min_tokens = int(value)
+    if "qwen35_ane_prefill_fraction" in sent:
+        value = request.qwen35_ane_prefill_fraction
+        if value is None or not 0.05 <= value <= 0.90:
+            raise HTTPException(
+                status_code=400,
+                detail="MLP ANE fraction must be between 0.05 and 0.90.",
+            )
+        current_settings.qwen35_ane_prefill_fraction = float(value)
+    if "qwen35_ane_prefill_max_layers" in sent:
+        value = request.qwen35_ane_prefill_max_layers
+        if value is None or value < 1:
+            raise HTTPException(
+                status_code=400, detail="ANE MLP layer limit must be positive."
+            )
+        current_settings.qwen35_ane_prefill_max_layers = int(value)
+    if "qwen35_ane_prefill_dual_ane" in sent:
+        current_settings.qwen35_ane_prefill_dual_ane = bool(
+            request.qwen35_ane_prefill_dual_ane
+        )
+    if "qwen35_ane_prefill_gdn" in sent:
+        current_settings.qwen35_ane_prefill_gdn = bool(request.qwen35_ane_prefill_gdn)
+    if "qwen35_ane_prefill_gdn_fraction" in sent:
+        value = request.qwen35_ane_prefill_gdn_fraction
+        if value is None or not 0.05 <= value <= 0.90:
+            raise HTTPException(
+                status_code=400,
+                detail="GDN ANE fraction must be between 0.05 and 0.90.",
+            )
+        current_settings.qwen35_ane_prefill_gdn_fraction = float(value)
+    if "qwen35_ane_prefill_gdn_max_layers" in sent:
+        value = request.qwen35_ane_prefill_gdn_max_layers
+        if value is None or value < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="ANE GDN layer limit must be zero or greater.",
+            )
+        current_settings.qwen35_ane_prefill_gdn_max_layers = int(value)
+    if "qwen35_ane_prefill_cpu_enabled" in sent:
+        current_settings.qwen35_ane_prefill_cpu_enabled = bool(
+            request.qwen35_ane_prefill_cpu_enabled
+        )
+    if "qwen35_ane_prefill_fused_down" in sent:
+        current_settings.qwen35_ane_prefill_fused_down = bool(
+            request.qwen35_ane_prefill_fused_down
+        )
+    if "qwen35_ane_prefill_cpu_fraction" in sent:
+        value = request.qwen35_ane_prefill_cpu_fraction
+        if value is None or not 0.0 <= value <= 0.25:
+            raise HTTPException(
+                status_code=400,
+                detail="CPU MLP fraction must be between 0.0 and 0.25.",
+            )
+        current_settings.qwen35_ane_prefill_cpu_fraction = float(value)
+    if "qwen35_ane_prefill_cpu_down_fraction" in sent:
+        value = request.qwen35_ane_prefill_cpu_down_fraction
+        if value is None or not 0.0 <= value <= 0.50:
+            raise HTTPException(
+                status_code=400,
+                detail="CPU MLP down fraction must be between 0.0 and 0.50.",
+            )
+        current_settings.qwen35_ane_prefill_cpu_down_fraction = float(value)
+    if "qwen35_ane_prefill_cpu_gdn_fraction" in sent:
+        value = request.qwen35_ane_prefill_cpu_gdn_fraction
+        if value is None or not 0.0 <= value <= 0.50:
+            raise HTTPException(
+                status_code=400,
+                detail="CPU GDN fraction must be between 0.0 and 0.50",
+            )
+        current_settings.qwen35_ane_prefill_cpu_gdn_fraction = float(value)
+    if "qwen35_ane_prefill_cpu_threads" in sent:
+        value = request.qwen35_ane_prefill_cpu_threads
+        if value is None or not 0 <= value <= 64:
+            raise HTTPException(
+                status_code=400,
+                detail="CPU worker count must be between 0 and 64.",
+            )
+        current_settings.qwen35_ane_prefill_cpu_threads = int(value)
+    if "qwen35_ane_prefill_cpu_shared_resource" in sent:
+        current_settings.qwen35_ane_prefill_cpu_shared_resource = bool(
+            request.qwen35_ane_prefill_cpu_shared_resource
+        )
+    if (
+        current_settings.qwen35_ane_prefill_fused_down
+        and current_settings.qwen35_ane_prefill_fraction > 0.50
+    ):
+        # The fused loader reuses the MLP fraction for the down projection and
+        # rejects anything above 0.50 at enable time. Without this check the
+        # save succeeds and the next load silently disables ANE prefill.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Fused MLP/down offload needs an MLP ANE fraction of 0.50 or "
+                "less."
+            ),
+        )
+    if (
+        current_settings.qwen35_ane_prefill_cpu_enabled
+        and current_settings.qwen35_ane_prefill_fraction
+        * (2 if current_settings.qwen35_ane_prefill_fused_down else 1)
+        + current_settings.qwen35_ane_prefill_cpu_fraction
+        >= 1.0
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Two per-ANE MLP shares and the CPU share must total less than 1.0."
+                if current_settings.qwen35_ane_prefill_fused_down
+                else "MLP ANE and CPU fractions must total less than 1.0."
+            ),
+        )
+    if (
+        current_settings.qwen35_ane_prefill_cpu_enabled
+        and current_settings.qwen35_ane_prefill_gdn
+        and current_settings.qwen35_ane_prefill_gdn_fraction
+        + current_settings.qwen35_ane_prefill_cpu_gdn_fraction
+        >= 1.0
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="GDN ANE and CPU fractions must total less than 1.0.",
+        )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
@@ -2461,16 +2700,21 @@ async def update_model_settings(
             request.dflash_ssd_cache_max_bytes
         )
     if "dflash_draft_window_size" in sent:
-        # 0 / None / negative → fall back to dflash-mlx internal default (1024).
+        # 0 / None / negative → use config.sliding_window when present.
         value = request.dflash_draft_window_size
         current_settings.dflash_draft_window_size = (
             int(value) if value and value > 0 else None
         )
     if "dflash_draft_sink_size" in sent:
-        # Negative is invalid; 0 is a legal sink-size (no sink tokens).
+        # Negative / None → oMLX default 0 (no sink tokens).
         value = request.dflash_draft_sink_size
         current_settings.dflash_draft_sink_size = (
-            int(value) if value is not None and value >= 0 else None
+            int(value) if value is not None and value >= 0 else 0
+        )
+    if "dflash_block_size" in sent:
+        value = request.dflash_block_size
+        current_settings.dflash_block_size = (
+            int(value) if value is not None and value > 0 else None
         )
     if "dflash_verify_mode" in sent:
         value = request.dflash_verify_mode
@@ -2521,8 +2765,9 @@ async def update_model_settings(
                     detail=(
                         f"Model is not MTP-compatible (model_type={model_type!r}, "
                         f"mtp_num_hidden_layers={cfg.get('mtp_num_hidden_layers', 0)}). "
-                        "Lightning MTP requires a Qwen3.5/3.6, DeepSeek-V4 or "
-                        "GLM-5.2 checkpoint with MTP heads."
+                        "Lightning MTP requires a Qwen3.5/3.6, DeepSeek-V4, "
+                        "GLM-5.2, or merged-assistant Gemma 4 checkpoint with "
+                        "MTP heads."
                     ),
                 )
             if not _checkpoint_has_mtp_weights(entry.model_path):
@@ -2609,9 +2854,15 @@ async def update_model_settings(
         entry.is_pinned = request.is_pinned
     if request.is_default is not None:
         current_settings.is_default = request.is_default
-        # Update server_state.default_model if setting as default
-        if request.is_default and server_state:
-            server_state.default_model = model_id
+        if server_state:
+            if request.is_default:
+                server_state.default_model = model_id
+            elif server_state.default_model == model_id:
+                # Unsetting the model that IS the current default must clear
+                # the pointer, not just this model's own flag -- otherwise the
+                # server keeps treating an unpinned model as default until the
+                # next restart re-derives it from persisted settings.
+                server_state.default_model = None
     if request.is_hidden is not None:
         current_settings.is_hidden = request.is_hidden
     if request.is_favorite is not None:
@@ -2690,6 +2941,10 @@ async def update_model_settings(
     # effect at engine construction time is changed on a loaded model.
     requires_reload = entry.engine is not None and (
         ("model_type_override" in sent and entry.engine_type != prev_engine_type)
+        # Runtime-signature fields are engine-construction settings. This
+        # catches Qwen ANE controls (and future signature additions) without
+        # requiring a second hand-maintained field list here.
+        or prev_load_signature != current_load_signature
         or "index_cache_freq" in sent
         or "dflash_enabled" in sent
         or "dflash_draft_model" in sent
@@ -2959,7 +3214,10 @@ async def apply_model_profile(
     entry = _require_model(model_id)
     is_diffusion_model = _entry_is_diffusion_model(entry)
     sanitizer = _sanitize_diffusion_settings_dict if is_diffusion_model else None
-    applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
+    try:
+        applied = mgr.apply_profile(model_id, name, settings_sanitizer=sanitizer)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     if applied is None:
         raise HTTPException(status_code=404, detail=f"Profile not found: {name}")
     if is_diffusion_model:
@@ -3335,6 +3593,7 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                     False,
                 )
             ),
+            "max_audio_upload_size": global_settings.server.max_audio_upload_size,
         },
         "model": {
             "model_dirs": [
@@ -3372,11 +3631,18 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
                 )
             ),
             "hot_cache_only": global_settings.cache.hot_cache_only,
+            "hot_cache_write_through": global_settings.cache.hot_cache_write_through,
+            "ane_compile_cache": global_settings.cache.ane_compile_cache,
+            "gdn_snapshot_storage": global_settings.cache.get_gdn_snapshot_storage(),
+            "gdn_ssd_split_enabled": global_settings.cache.get_gdn_ssd_split_enabled(),
+            "gdn_ssd_pending_max_size": global_settings.cache.gdn_ssd_pending_max_size,
+            "gdn_sidecar_precision": global_settings.cache.gdn_sidecar_state_dtype,
             "hot_cache_max_size": global_settings.cache.hot_cache_max_size,
             "initial_cache_blocks": global_settings.cache.initial_cache_blocks,
         },
         "mcp": {
             "config_path": global_settings.mcp.config_path,
+            "expose_tools": global_settings.mcp.expose_tools,
         },
         "huggingface": {
             "endpoint": global_settings.huggingface.endpoint,
@@ -3474,9 +3740,9 @@ async def update_global_settings(
     """
     Update global server settings.
 
-    Updates are persisted to the global settings file. Some settings
-    (log_level, model_dir, memory_guard_tier, cache) are applied immediately,
-    while others (host, port, scheduler, mcp) require server restart.
+    Updates are persisted to the global settings file. Some settings,
+    including the MCP exposure toggle, are applied immediately, while network
+    binding and MCP config path changes require a server restart.
 
     Args:
         request: GlobalSettingsRequest with the new settings.
@@ -3578,6 +3844,23 @@ async def update_global_settings(
         global_settings.server.distributed_inference_enabled = (
             request.distributed_inference_enabled
         )
+    if request.max_audio_upload_size is not None:
+        from ..config import parse_size
+
+        try:
+            audio_upload_size = parse_size(request.max_audio_upload_size)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid max_audio_upload_size: {exc}",
+            ) from exc
+        if audio_upload_size <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="max_audio_upload_size must be positive",
+            )
+        global_settings.server.max_audio_upload_size = request.max_audio_upload_size
+        runtime_applied.append("max_audio_upload_size")
 
     if request.server_aliases is not None:
         from ..utils.network import is_valid_alias
@@ -3800,7 +4083,94 @@ async def update_global_settings(
             _parse_hot_cache_max_size(request.hot_cache_max_size)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if request.initial_cache_blocks is not None and request.initial_cache_blocks <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="initial_cache_blocks must be positive",
+        )
 
+    # GDN sidecar persistence requires the SSD tier. Validate the effective
+    # values before mutating the live settings object so an invalid admin
+    # update cannot leave an unsaved split/hot-only combination in memory.
+    requested_storage = request.gdn_snapshot_storage
+    if requested_storage is not None:
+        requested_storage = requested_storage.strip().lower()
+        if requested_storage not in {"auto", "ssd", "ssd_sidecar", "hot", "embedded"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "gdn_snapshot_storage must be one of: "
+                    "auto, ssd_sidecar, embedded"
+                ),
+            )
+    if requested_storage is not None and request.gdn_ssd_split_enabled is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "gdn_snapshot_storage cannot be combined with the legacy "
+                "gdn_ssd_split_enabled field"
+            ),
+        )
+
+    current_gdn_raw = getattr(
+        global_settings.cache, "gdn_ssd_split_enabled", False
+    )
+    current_hot_only = getattr(global_settings.cache, "hot_cache_only", False)
+    effective_hot_only = (
+        request.hot_cache_only
+        if request.hot_cache_only is not None
+        else current_hot_only is True
+    )
+    current_cache_enabled = getattr(global_settings.cache, "enabled", True)
+    effective_cache_enabled = (
+        request.cache_enabled
+        if request.cache_enabled is not None
+        else current_cache_enabled is not False
+    )
+    if requested_storage == "auto":
+        effective_gdn_split = effective_cache_enabled and not effective_hot_only
+    elif requested_storage in {"ssd", "ssd_sidecar"}:
+        effective_gdn_split = True
+    elif requested_storage in {"hot", "embedded"}:
+        effective_gdn_split = False
+    elif request.gdn_ssd_split_enabled is not None:
+        effective_gdn_split = request.gdn_ssd_split_enabled
+    elif current_gdn_raw is None:
+        effective_gdn_split = effective_cache_enabled and not effective_hot_only
+    else:
+        effective_gdn_split = current_gdn_raw is True
+    if effective_gdn_split and effective_hot_only:
+        raise HTTPException(
+            status_code=400,
+            detail="gdn_ssd_split_enabled cannot be used with hot_cache_only",
+        )
+    if request.gdn_ssd_pending_max_size is not None:
+        from ..config import parse_size
+
+        try:
+            pending_size = parse_size(request.gdn_ssd_pending_max_size)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid gdn_ssd_pending_max_size: {exc}",
+            ) from exc
+        if pending_size <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="gdn_ssd_pending_max_size must be positive",
+            )
+    if (
+        request.gdn_sidecar_precision is not None
+        and request.gdn_sidecar_precision.lower()
+        not in {"fp32", "bf16", "int8", "rht_int8", "rht_int16"}
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "gdn_sidecar_precision must be one of: "
+                "fp32, bf16, int8, rht_int8, rht_int16"
+            ),
+        )
     # Apply cache settings
     cache_changed = False
     if request.cache_enabled is not None:
@@ -3814,11 +4184,43 @@ async def update_global_settings(
         cache_changed = True
     if request.hot_cache_only is not None:
         global_settings.cache.hot_cache_only = request.hot_cache_only
+        cache_changed = True
+    if request.hot_cache_write_through is not None:
+        global_settings.cache.hot_cache_write_through = (
+            request.hot_cache_write_through
+        )
+        cache_changed = True
+    if requested_storage is not None:
+        global_settings.cache.set_gdn_snapshot_storage(requested_storage)
+        cache_changed = True
+    elif request.gdn_ssd_split_enabled is not None:
+        global_settings.cache.gdn_ssd_split_enabled = request.gdn_ssd_split_enabled
+        cache_changed = True
+    if request.gdn_ssd_pending_max_size is not None:
+        global_settings.cache.gdn_ssd_pending_max_size = (
+            request.gdn_ssd_pending_max_size
+        )
+        cache_changed = True
+    if request.gdn_sidecar_precision is not None:
+        global_settings.cache.gdn_sidecar_state_dtype = (
+            request.gdn_sidecar_precision.lower()
+        )
+        cache_changed = True
     if request.hot_cache_max_size is not None:
         global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
         cache_changed = True
     if request.initial_cache_blocks is not None:
         global_settings.cache.initial_cache_blocks = request.initial_cache_blocks
+        cache_changed = True
+    # No cache_changed: reloading models cannot re-arm the native gate, which
+    # reads the env var once at the first ANE compile of the process. The env
+    # update covers a process that has not compiled yet; otherwise restart.
+    if request.ane_compile_cache is not None:
+        global_settings.cache.ane_compile_cache = request.ane_compile_cache
+        if request.ane_compile_cache:
+            os.environ["OMLX_QWEN35_ANE_COMPILE_CACHE"] = "1"
+        else:
+            os.environ.pop("OMLX_QWEN35_ANE_COMPILE_CACHE", None)
 
     if cache_changed:
         success, msg = await _apply_cache_settings_runtime(
@@ -3834,11 +4236,15 @@ async def update_global_settings(
         else:
             logger.warning(f"Failed to apply cache settings runtime: {msg}")
 
-    # Apply MCP settings (restart required)
+    # MCP config path changes require restart; exposure changes are live.
     if request.mcp_config is not None:
         global_settings.mcp.config_path = (
             request.mcp_config if request.mcp_config else None
         )
+    # MCP expose toggle is applied at runtime (no restart needed)
+    if request.mcp_expose_tools is not None:
+        global_settings.mcp.expose_tools = request.mcp_expose_tools
+        runtime_applied.append("mcp_expose_tools")
 
     # Apply HuggingFace settings (Live - immediately applied via env var)
     if request.hf_endpoint is not None:
@@ -4259,6 +4665,7 @@ class WebSearchTestRequest(BaseModel):
     brave_api_key: str = ""
     searxng_url: str = ""
     ddgs_backends: str = ""
+    max_results: int = Field(default=DEFAULT_MAX_RESULTS, ge=1, le=10)
 
 
 @router.post("/api/web-search/test")
@@ -4278,6 +4685,7 @@ async def test_web_search(
         brave_api_key=request.brave_api_key,
         searxng_url=request.searxng_url,
         ddgs_backends=request.ddgs_backends,
+        max_results=request.max_results,
     )
 
 
@@ -4691,6 +5099,59 @@ def _build_runtime_cache_observability(
             and partial_block_skips > 0
         )
 
+        gdn_staging = runtime_stats.get("gdn_staging")
+        if not isinstance(gdn_staging, dict):
+            gdn_staging = {}
+        gdn_last_restore = prefix_stats.get("gdn_last_restore")
+        if not isinstance(gdn_last_restore, dict):
+            gdn_last_restore = None
+
+        # Keep the cache fields at the model-row level so the dashboard and
+        # external admin clients can inspect them without knowing scheduler's
+        # internal nested stats shape.  These are all existing counters; this
+        # route only maps them and does not alter their accounting.
+        gdn_staging_payload = {
+            "pending_bytes": int(gdn_staging.get("pending_bytes", 0) or 0),
+            "pending_peak_bytes": int(
+                gdn_staging.get("pending_peak_bytes", 0) or 0
+            ),
+            "backpressure_ms": float(gdn_staging.get("backpressure_ms", 0) or 0),
+            "state_dtype": str(
+                gdn_staging.get("state_dtype", "fp32") or "fp32"
+            ),
+            "state_dequantizations": int(
+                gdn_staging.get("state_dequantizations", 0) or 0
+            ),
+            "encode_failures": int(gdn_staging.get("encode_failures", 0) or 0),
+            "decode_failures": int(gdn_staging.get("decode_failures", 0) or 0),
+            "capability_fallbacks": int(
+                gdn_staging.get("capability_fallbacks", 0) or 0
+            ),
+            "legacy_fp32_fallbacks": int(
+                gdn_staging.get("legacy_fp32_fallbacks", 0) or 0
+            ),
+            "sidecar_count": int(gdn_staging.get("sidecar_count", 0) or 0),
+            "sidecar_size_bytes": int(
+                gdn_staging.get("sidecar_size_bytes", 0) or 0
+            ),
+        }
+        ssd_counter_fields = (
+            "hits",
+            "misses",
+            "evictions",
+            "saves",
+            "saves_persisted",
+            "loads",
+            "errors",
+            "ssd_write_drops",
+            "ssd_inline_write_fallbacks",
+            "evict_unlink_failures",
+            "hot_cache_hits",
+            "hot_cache_evictions",
+            "hot_cache_promotions",
+            "hot_cache_promotion_failures",
+        )
+
         model_payload = {
             "id": model_id,
             "block_size": block_size,
@@ -4709,7 +5170,19 @@ def _build_runtime_cache_observability(
             "hot_cache_max_bytes": int(ssd_stats.get("hot_cache_max_bytes", 0) or 0),
             "hot_cache_size_bytes": int(ssd_stats.get("hot_cache_size_bytes", 0) or 0),
             "hot_cache_entries": int(ssd_stats.get("hot_cache_entries", 0) or 0),
+            "gdn_checkpoint_loads": int(
+                prefix_stats.get("gdn_checkpoint_loads", 0) or 0
+            ),
+            "gdn_checkpoint_walkbacks": int(
+                prefix_stats.get("gdn_checkpoint_walkbacks", 0) or 0
+            ),
+            "gdn_last_restore": gdn_last_restore,
+            "gdn_staging": gdn_staging_payload,
         }
+
+        for field in ssd_counter_fields:
+            if field in ssd_stats:
+                model_payload[field] = int(ssd_stats.get(field, 0) or 0)
 
         cache_rates = runtime_stats.get("cache_rates")
         if cache_rates:
@@ -6158,6 +6631,19 @@ async def add_to_accuracy_queue(
     if engine_pool is None:
         raise HTTPException(status_code=503, detail="Engine pool not initialized")
 
+    from .ane_tuning import get_active_run as get_active_ane_tuning
+
+    tuning_active = get_active_ane_tuning()
+    if tuning_active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"ANE tuning is already running "
+                f"(tuning_id={tuning_active.tuning_id}, "
+                f"model_id={tuning_active.request.model_id})."
+            ),
+        )
+
     from .context_benchmark import get_active_run as get_active_context_run
 
     context_active = get_active_context_run()
@@ -6322,6 +6808,114 @@ async def stream_accuracy_benchmark(
 
 
 # =============================================================================
+# ANE Split Tuning API Routes (MUST be before throughput {bench_id} routes)
+# =============================================================================
+
+
+@router.post("/api/bench/ane-tune/start")
+async def start_ane_tuning(
+    request: Request,
+    is_admin: bool = Depends(require_admin),
+):
+    """Tune the Qwen ANE/GPU split without changing persisted settings."""
+    from .accuracy_benchmark import get_queue_status
+    from .ane_tuning import (
+        ANETuningRequest,
+        cleanup_old_runs,
+        create_run,
+        get_active_run,
+        run_tuning,
+    )
+    from .benchmark import get_active_run as get_active_throughput_run
+    from .context_benchmark import get_active_run as get_active_context_run
+
+    engine_pool = _get_engine_pool()
+    if engine_pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    active = get_active_run()
+    if active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"ANE tuning is already running (tuning_id={active.tuning_id}, "
+                f"model_id={active.request.model_id})."
+            ),
+        )
+    throughput = get_active_throughput_run()
+    if throughput is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A throughput benchmark is already running ({throughput.bench_id}).",
+        )
+    context = get_active_context_run()
+    if context is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A context benchmark is already running ({context.bench_id}).",
+        )
+    accuracy = get_queue_status()
+    if accuracy.get("running"):
+        raise HTTPException(
+            status_code=409, detail="An accuracy benchmark is already running."
+        )
+
+    body = await request.json()
+    try:
+        tuning_request = ANETuningRequest(**body)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    entry = engine_pool.get_entry(tuning_request.model_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=404, detail=f"Model not found: {tuning_request.model_id}"
+        )
+    if entry.model_type not in ("llm", "vlm", None):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model {tuning_request.model_id} is not a supported language model",
+        )
+
+    cleanup_old_runs()
+    run = create_run(tuning_request)
+    run.task = asyncio.create_task(run_tuning(run, engine_pool))
+    return {"tuning_id": run.tuning_id, "status": "started", "total": run.total}
+
+
+@router.get("/api/bench/ane-tune/{tuning_id}/results")
+async def get_ane_tuning_results(
+    tuning_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    from .ane_tuning import get_run, run_snapshot
+
+    run = get_run(tuning_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"ANE tuning not found: {tuning_id}")
+    return run_snapshot(run)
+
+
+@router.post("/api/bench/ane-tune/{tuning_id}/cancel")
+async def cancel_ane_tuning(
+    tuning_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    from .ane_tuning import get_run
+
+    run = get_run(tuning_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"ANE tuning not found: {tuning_id}")
+    if run.status != "running":
+        raise HTTPException(
+            status_code=400, detail=f"ANE tuning is not running ({run.status})"
+        )
+    if run.task is not None and not run.task.done():
+        run.task.cancel()
+    return {"status": "cancelled", "tuning_id": tuning_id}
+
+
+# =============================================================================
 # Context Benchmark API Routes (MUST be before throughput {bench_id} routes)
 # =============================================================================
 
@@ -6387,6 +6981,17 @@ async def start_context_benchmark(
                 f"A throughput benchmark is already running "
                 f"(bench_id={throughput_active.bench_id}, "
                 f"model_id={throughput_active.request.model_id})."
+            ),
+        )
+    from .ane_tuning import get_active_run as get_active_ane_tuning
+
+    tuning_active = get_active_ane_tuning()
+    if tuning_active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"ANE tuning is already running (tuning_id={tuning_active.tuning_id}, "
+                f"model_id={tuning_active.request.model_id})."
             ),
         )
     accuracy_status = get_queue_status()
@@ -6642,6 +7247,18 @@ async def start_benchmark(
                 f"A context benchmark is already running "
                 f"(bench_id={context_active.bench_id}, "
                 f"model_id={context_active.request.model_id})."
+            ),
+        )
+
+    from .ane_tuning import get_active_run as get_active_ane_tuning
+
+    tuning_active = get_active_ane_tuning()
+    if tuning_active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"ANE tuning is already running (tuning_id={tuning_active.tuning_id}, "
+                f"model_id={tuning_active.request.model_id})."
             ),
         )
 

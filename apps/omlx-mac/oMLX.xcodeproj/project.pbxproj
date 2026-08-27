@@ -102,6 +102,7 @@
 		BBB000000000000000000002 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000002 /* Localizable.xcstrings */; };
 		BBB000000000000000000004 /* AppUpdater.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000003 /* AppUpdater.swift */; };
 		BBB000000000000000000005 /* ReleasesChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000004 /* ReleasesChecker.swift */; };
+		BBB000000000000000000006 /* UpdateInstaller.swift in Sources */ = {isa = PBXBuildFile; fileRef = BCC000000000000000000005 /* UpdateInstaller.swift */; };
 		DBB000000000000000000001 /* AppServicesPathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000001 /* AppServicesPathTests.swift */; };
 		DBB000000000000000000002 /* AppConfigTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000002 /* AppConfigTests.swift */; };
 		DBB000000000000000000003 /* ServerScreenVMStorageDiffTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */; };
@@ -130,9 +131,11 @@
 		DBB000000000000000000107 /* ModelsScreenSortingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000107 /* ModelsScreenSortingTests.swift */; };
 		DBB000000000000000000110 /* MenubarControllerModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000110 /* MenubarControllerModelsTests.swift */; };
 		DBB000000000000000000109 /* AppUpdaterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000109 /* AppUpdaterTests.swift */; };
-		DBB000000000000000000114 /* PythonRuntimeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000114 /* PythonRuntimeTests.swift */; };
+		DBBFF514B15B553884AE99AF /* PythonRuntimeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCCFF084EBAF782934FD1847 /* PythonRuntimeTests.swift */; };
 		DBB000000000000000000108 /* ModelSettingsScreenVMTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */; };
 		DBB000000000000000000113 /* PerformanceScreenVMTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000113 /* PerformanceScreenVMTests.swift */; };
+		DBB000000000000000000114 /* UpdateInstallerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000114 /* UpdateInstallerTests.swift */; };
+		DBB000000000000000000115 /* AppUpdaterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCC000000000000000000115 /* AppUpdaterTests.swift */; };
 		EBB000000000000000000001 /* MarkdownUI in Frameworks */ = {isa = PBXBuildFile; productRef = ECC000000000000000000001 /* MarkdownUI */; };
 /* End PBXBuildFile section */
 
@@ -245,6 +248,7 @@
 		BCC000000000000000000002 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
 		BCC000000000000000000003 /* AppUpdater.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdater.swift; sourceTree = "<group>"; };
 		BCC000000000000000000004 /* ReleasesChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReleasesChecker.swift; sourceTree = "<group>"; };
+		BCC000000000000000000005 /* UpdateInstaller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateInstaller.swift; sourceTree = "<group>"; };
 		DCC000000000000000000001 /* AppServicesPathTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppServicesPathTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000002 /* AppConfigTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfigTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000003 /* ServerScreenVMStorageDiffTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerScreenVMStorageDiffTests.swift; sourceTree = "<group>"; };
@@ -274,9 +278,11 @@
 		DCC000000000000000000107 /* ModelsScreenSortingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelsScreenSortingTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000110 /* MenubarControllerModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MenubarControllerModelsTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000109 /* AppUpdaterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdaterTests.swift; sourceTree = "<group>"; };
-		DCC000000000000000000114 /* PythonRuntimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PythonRuntimeTests.swift; sourceTree = "<group>"; };
+		DCCFF084EBAF782934FD1847 /* PythonRuntimeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PythonRuntimeTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelSettingsScreenVMTests.swift; sourceTree = "<group>"; };
 		DCC000000000000000000113 /* PerformanceScreenVMTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerformanceScreenVMTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000114 /* UpdateInstallerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateInstallerTests.swift; sourceTree = "<group>"; };
+		DCC000000000000000000115 /* AppUpdaterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppUpdaterTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -345,9 +351,11 @@
 				DCC000000000000000000107 /* ModelsScreenSortingTests.swift */,
 				DCC000000000000000000110 /* MenubarControllerModelsTests.swift */,
 				DCC000000000000000000109 /* AppUpdaterTests.swift */,
-				DCC000000000000000000114 /* PythonRuntimeTests.swift */,
+				DCCFF084EBAF782934FD1847 /* PythonRuntimeTests.swift */,
 				DCC000000000000000000108 /* ModelSettingsScreenVMTests.swift */,
 				DCC000000000000000000113 /* PerformanceScreenVMTests.swift */,
+				DCC000000000000000000114 /* UpdateInstallerTests.swift */,
+				DCC000000000000000000115 /* AppUpdaterTests.swift */,
 			);
 			path = oMLXTests;
 			sourceTree = "<group>";
@@ -541,6 +549,7 @@
 				7CC000000000000000000008 /* UpdateController.swift */,
 				BCC000000000000000000003 /* AppUpdater.swift */,
 				BCC000000000000000000004 /* ReleasesChecker.swift */,
+				BCC000000000000000000005 /* UpdateInstaller.swift */,
 			);
 			path = Updater;
 			sourceTree = "<group>";
@@ -779,6 +788,7 @@
 				ABB000000000000000000001 /* WelcomeWindow.swift in Sources */,
 				BBB000000000000000000004 /* AppUpdater.swift in Sources */,
 				BBB000000000000000000005 /* ReleasesChecker.swift in Sources */,
+				BBB000000000000000000006 /* UpdateInstaller.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -812,9 +822,11 @@
 				DBB000000000000000000107 /* ModelsScreenSortingTests.swift in Sources */,
 				DBB000000000000000000110 /* MenubarControllerModelsTests.swift in Sources */,
 				DBB000000000000000000109 /* AppUpdaterTests.swift in Sources */,
-				DBB000000000000000000114 /* PythonRuntimeTests.swift in Sources */,
+				DBBFF514B15B553884AE99AF /* PythonRuntimeTests.swift in Sources */,
 				DBB000000000000000000108 /* ModelSettingsScreenVMTests.swift in Sources */,
 				DBB000000000000000000113 /* PerformanceScreenVMTests.swift in Sources */,
+				DBB000000000000000000114 /* UpdateInstallerTests.swift in Sources */,
+				DBB000000000000000000115 /* AppUpdaterTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

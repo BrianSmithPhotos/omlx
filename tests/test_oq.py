@@ -28,6 +28,7 @@ from omlx.oq import (
     OQ_LEVELS,
     OQImatrixCollector,
     OQImatrixEntry,
+    _affine_perturb_group_size,
     _bpw_targets_for_level,
     _build_proxy_for_sensitivity,
     _build_quant_plan,
@@ -1209,6 +1210,137 @@ class TestStreamingHelpers:
         assert bits == 8
         assert gs == 64
         assert mode == "affine"
+
+    @pytest.mark.parametrize("oq_level, expected_bits", [(4, 4), (6, 6), (8, 8)])
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shard_0.weight",
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shards.0.weight",
+        ],
+    )
+    def test_qwen4_ngram_uses_base_bits_and_group32(
+        self, oq_level, expected_bits, path
+    ):
+        config = {
+            "model_type": "qwen4_exp",
+            "text_config": {"model_type": "qwen4_exp_text"},
+            "_oq_boost_map": {
+                path.removesuffix(".weight"): {
+                    "bits": 8,
+                    "group_size": 64,
+                    "mode": "affine",
+                }
+            },
+        }
+
+        bits, gs, mode = _get_predicate_bits(path, config, oq_level, 64)
+
+        assert (bits, gs, mode) == (expected_bits, 32, "affine")
+
+    def test_non_qwen4_ngram_keeps_default_group_size(self):
+        path = (
+            "model.layers.1.ple.ple_embedding.ngram_embedding."
+            "shards.0.weight"
+        )
+
+        bits, gs, mode = _get_predicate_bits(
+            path, {"model_type": "other"}, 4, 64
+        )
+
+        assert (bits, gs, mode) == (4, 64, "affine")
+
+    def test_qwen4_ngram_is_exempt_from_strict_imatrix_lookup(self):
+        from omlx.oq import OQImatrixData, _lookup_imatrix_importance
+
+        path = (
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shards.0.weight"
+        )
+        imatrix = OQImatrixData(entries={}, metadata={}, path="unused.npz")
+        report = {"missing": [], "mismatched": [], "applied": []}
+
+        importance = _lookup_imatrix_importance(
+            imatrix,
+            path,
+            (156_250, 160),
+            config={"model_type": "qwen4_exp"},
+            strict=True,
+            report=report,
+        )
+
+        assert importance is None
+        assert report["missing"] == []
+
+    def test_token_embedding_is_exempt_from_strict_imatrix_lookup(self):
+        from omlx.oq import OQImatrixData, _lookup_imatrix_importance
+
+        imatrix = OQImatrixData(entries={}, metadata={}, path="unused.npz")
+        report = {"missing": [], "mismatched": [], "applied": []}
+
+        importance = _lookup_imatrix_importance(
+            imatrix,
+            "language_model.model.embed_tokens.weight",
+            (154_880, 256),
+            config={"model_type": "glm5_next"},
+            strict=True,
+            report=report,
+        )
+
+        assert importance is None
+        assert report["missing"] == []
+
+    def test_qwen4_ngram_group32_is_priced_into_budget_plan(self):
+        from omlx.oq import _structural_quant_overrides
+
+        ple = (
+            "language_model.model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shards.0"
+        )
+        named_shapes = {
+            ple: (2_800, 160),
+            "language_model.model.layers.0.mlp.switch_mlp.gate_proj": (
+                100,
+                64,
+                256,
+            ),
+            "language_model.lm_head": (16, 256),
+        }
+        config = {
+            "model_type": "qwen4_exp",
+            "text_config": {"model_type": "qwen4_exp_text"},
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {"0": 1.0, "1": 0.5},
+        }
+
+        unpriced = _build_quant_plan(
+            named_shapes,
+            config,
+            4,
+            target_bpw=4.6,
+            hard_cap_bpw=4.7,
+        )
+        fixed = _structural_quant_overrides(named_shapes, config, 4)
+        plan = _build_quant_plan(
+            named_shapes,
+            config,
+            4,
+            target_bpw=4.6,
+            hard_cap_bpw=4.7,
+            fixed_overrides=fixed,
+        )
+
+        assert unpriced.effective_bpw > 5.5
+        assert fixed[ple] == {
+            "bits": 4,
+            "group_size": 32,
+            "mode": "affine",
+        }
+        assert plan.effective_bpw <= 4.7
+        assert ple not in plan.boost_map
+        assert plan.boost_map["language_model.lm_head"]["bits"] == 8
 
     def test_build_quant_plan_respects_hard_cap(self):
         named_shapes = {
@@ -2527,6 +2659,25 @@ class TestDiscoverSanitizePlan:
         assert "model.embed_tokens.weight" not in plan
         assert len(plan) == len(tensors) - 1
 
+    def test_safetensors_dtype_supports_issubdtype_sanitize(self, sf_file):
+        path, tensors = sf_file
+        idx = _LazyTensorIndex([path])
+
+        def cast_floating_sanitize(weights):
+            return {
+                key: (
+                    value.astype(mx.float32)
+                    if mx.issubdtype(value.dtype, mx.floating)
+                    else value
+                )
+                for key, value in weights.items()
+            }
+
+        plan = _discover_sanitize_plan(cast_floating_sanitize, idx)
+
+        assert set(plan) == set(tensors)
+        assert all(info["transform"] == "astype" for info in plan.values())
+
     def test_swapaxes_sanitize(self, sf_file):
         path, _tensors = sf_file
         idx = _LazyTensorIndex([path])
@@ -2589,6 +2740,26 @@ class TestDiscoverSanitizePlan:
             rtol=1e-3,
             atol=1e-3,
         )
+
+    def test_concatenate_moveaxis_sanitize_replays(self, tmp_path):
+        path = tmp_path / "weights.safetensors"
+        tensors = {
+            f"conv.{index}.weight": np.full((2, 3, 1), index, dtype=np.float16)
+            for index in range(3)
+        }
+        _write_safetensors(str(path), tensors)
+        idx = _LazyTensorIndex([str(path)])
+
+        def sanitize(weights):
+            fused = mx.concatenate(list(weights.values()), axis=1)
+            return {"conv.weight": fused.moveaxis(2, 1)}
+
+        plan = _discover_sanitize_plan(sanitize, idx)
+        assert plan["conv.weight"]["transform"] == "expr"
+        result = _DiscoveredPlan(plan, idx).pop("conv.weight")
+        expected = np.concatenate(list(tensors.values()), axis=1).transpose(0, 2, 1)
+
+        np.testing.assert_array_equal(np.array(result), expected)
 
     def test_expand_dims_sanitize_replays(self, tmp_path):
         path = tmp_path / "weights.safetensors"
@@ -3136,6 +3307,55 @@ class TestBuildProxyForSensitivity:
         assert config["quantization"]["group_size"] == _PROXY_QUANT_GROUP_SIZE
         assert (out / "model.safetensors").exists()
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_qwen4_streaming_proxy_records_group32_for_ngram_table(self, tmp_path):
+        """The BF16-source calibration proxy must match Qwen4 PLE layout."""
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        out = tmp_path / "proxy"
+        src.mkdir()
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "qwen4_exp",
+                    "text_config": {"model_type": "qwen4_exp_text"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        prefix = "model.language_model.layers.1.ple"
+        table = f"{prefix}.ple_embedding.ngram_embedding.shard_0"
+        np_save(
+            {
+                f"{table}.weight": np.ones((2, 160), dtype=np.float16),
+                f"{prefix}.key_proj.weight": np.ones(
+                    (32, 256), dtype=np.float16
+                ),
+                f"{prefix}.value_proj.weight": np.ones(
+                    (32, 256), dtype=np.float16
+                ),
+            },
+            str(src / "model.safetensors"),
+        )
+
+        with (
+            patch("omlx.oq._build_model_sanitizer", return_value=None),
+            patch("omlx.oq._build_non_quantizable_set", return_value=set()),
+        ):
+            _build_streaming_proxy_for_sensitivity(str(src), out, dtype="bfloat16")
+
+        config = json.loads((out / "config.json").read_text(encoding="utf-8"))
+        quantization = config["quantization"]
+        assert quantization["group_size"] == _PROXY_QUANT_GROUP_SIZE
+        assert quantization[table] == {
+            "bits": _PROXY_QUANT_BITS,
+            "group_size": 32,
+            "mode": "affine",
+        }
+        assert f"{prefix}.key_proj" not in quantization
+        assert f"{prefix}.value_proj" not in quantization
+
 
 class TestSensitivityRequiredEnforcement:
     """Regression tests: quantize_oq_streaming must abort when sensitivity
@@ -3356,6 +3576,134 @@ class TestSensitivityRequiredEnforcement:
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
 class TestOnTheFlyFp8Dequant:
+    def test_qwen4_ple_bf16_shard_stays_on_standard_float_path(self, tmp_path):
+        dense = mx.array(
+            [
+                [1.0, -0.5, 0.25, 2.0] * 8,
+                [-1.0, 0.5, -0.25, -2.0] * 8,
+            ],
+            dtype=mx.bfloat16,
+        )
+        key = (
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shard_0.weight"
+        )
+        path = str(tmp_path / "qwen4_ple_bf16.safetensors")
+        _write_safetensors(
+            path,
+            {
+                key: (
+                    np.asarray(dense.view(mx.uint16)).tobytes(),
+                    list(dense.shape),
+                    "BF16",
+                ),
+            },
+        )
+        config = {
+            "model_type": "qwen4_exp",
+            "text_config": {
+                "model_type": "qwen4_exp_text",
+                "ple_layer_ids": [2],
+                "split_ngram_parts": 1,
+            },
+        }
+
+        idx = _LazyTensorIndex([path], config=config)
+
+        assert idx.source_dtype(key) == "BF16"
+        assert idx.logical_metadata()[key] == (tuple(dense.shape), "BF16")
+        assert key not in idx._virtual
+        loaded = idx.pop(key)
+        mx.eval(loaded, dense)
+        assert loaded.dtype == mx.bfloat16
+        assert mx.array_equal(loaded, dense).item()
+
+        from omlx.oq import _quantize_chunked
+
+        weight, scales, biases = _quantize_chunked(
+            loaded, group_size=32, bits=4, mode="affine"
+        )
+        mx.eval(weight, scales, biases)
+        assert weight.dtype == mx.uint32
+        assert weight.shape == (2, 4)
+        assert scales.shape == biases.shape == (2, 1)
+
+    def test_qwen4_ple_fp8_shard_is_decoded_before_affine_quantization(self, tmp_path):
+        dense = mx.array(
+            [
+                [1.0, -0.5, 0.25, 2.0] * 8,
+                [-1.0, 0.5, -0.25, -2.0] * 8,
+            ],
+            dtype=mx.bfloat16,
+        )
+        fp8 = mx.to_fp8(dense)
+        key = (
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shard_0.weight"
+        )
+        scale_key = (
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding.weight_scale"
+        )
+        path = str(tmp_path / "qwen4_ple.safetensors")
+        _write_safetensors(
+            path,
+            {
+                key: (
+                    np.asarray(fp8).tobytes(),
+                    list(fp8.shape),
+                    "F8_E4M3",
+                ),
+                scale_key: np.array([0.125], dtype=np.float16),
+            },
+        )
+        config = {
+            "model_type": "qwen4_exp",
+            "text_config": {
+                "model_type": "qwen4_exp_text",
+                "ple_layer_ids": [2],
+                "split_ngram_parts": 1,
+            },
+        }
+
+        idx = _LazyTensorIndex([path], config=config)
+
+        assert idx.source_dtype(key) == "F8_E4M3"
+        assert idx.logical_metadata()[key] == (tuple(fp8.shape), "BF16")
+        assert scale_key in idx
+        decoded = idx.pop(key)
+        expected = mx.from_fp8(fp8, dtype=mx.bfloat16)
+        mx.eval(decoded, expected)
+        assert decoded.dtype == mx.bfloat16
+        assert mx.array_equal(decoded, expected).item()
+
+        from omlx.oq import _quantize_chunked
+
+        weight, scales, biases = _quantize_chunked(
+            decoded, group_size=32, bits=4, mode="affine"
+        )
+        mx.eval(weight, scales, biases)
+        assert weight.dtype == mx.uint32
+        assert weight.shape == (2, 4)
+        assert scales.shape == biases.shape == (2, 1)
+
+    def test_qwen4_ple_virtual_decode_does_not_claim_other_models(self, tmp_path):
+        raw = np.arange(64, dtype=np.uint8).reshape(2, 32)
+        key = (
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shard_0.weight"
+        )
+        path = str(tmp_path / "other_ple.safetensors")
+        _write_safetensors(
+            path,
+            {key: (raw.tobytes(), list(raw.shape), "F8_E4M3")},
+        )
+
+        idx = _LazyTensorIndex([path], config={"model_type": "other"})
+
+        assert idx.logical_metadata()[key] == (tuple(raw.shape), "F8_E4M3")
+        assert idx[key].dtype == mx.uint8
+
     def test_vllm_scale_inv_convention(self, tmp_path):
         """vLLM convention: weight (F8_E4M3) + weight_scale_inv (F32)."""
         w = np.random.randint(0, 255, (128, 128), dtype=np.uint8)
@@ -3688,6 +4036,40 @@ class TestPerturbBitsFor:
         assert _perturb_bits_for(4) == 3
         assert _perturb_bits_for(3) == 2
         assert _perturb_bits_for(2) is None
+
+
+class TestAffinePerturbGroupSize:
+    """The perturbation re-quant is always affine, which ships only 32/64/128."""
+
+    @pytest.mark.parametrize("gs", [32, 64, 128])
+    def test_supported_group_sizes_are_kept(self, gs):
+        # A module quantized at gs always has in_dim % gs == 0, so the
+        # perturbation of every affine/mxfp4/mxfp8 source is byte-identical
+        # to what it was before the nvfp4 clamp existed.
+        assert _affine_perturb_group_size(gs, 4096) == gs
+
+    def test_nvfp4_group_16_clamps_to_nearest_supported(self):
+        # nvfp4 is the only MLX mode with group_size=16; 32 is both the
+        # nearest supported size and the finest, so it adds the least
+        # grouping error on top of the bit-width reduction being measured.
+        assert _affine_perturb_group_size(16, 4096) == 32
+
+    def test_unsupported_sizes_pick_the_nearest_divisor(self):
+        assert _affine_perturb_group_size(8, 1024) == 32
+        assert _affine_perturb_group_size(256, 1024) == 128
+        # 96 is equidistant from 64 and 128; the smaller (finer) size wins.
+        assert _affine_perturb_group_size(96, 1024) == 64
+
+    def test_own_size_wins_over_a_closer_but_indivisible_one(self):
+        # 192 is not a multiple of 128, so a gs=64 module keeps 64 rather
+        # than being pushed to a size that cannot quantize its rows.
+        assert _affine_perturb_group_size(64, 192) == 64
+
+    def test_none_when_no_supported_size_divides_the_row(self):
+        # in_dim % 16 == 0 but in_dim % 32 != 0: reachable for an nvfp4
+        # module, and re-quantizing it at any affine size would raise.
+        assert _affine_perturb_group_size(16, 48) is None
+        assert _affine_perturb_group_size(16, 112) is None
 
 
 class TestShouldQuantizeTensorWeightGuard:
@@ -4935,6 +5317,136 @@ class TestMeasureSensitivityQuantizedVlm:
         lm_load.assert_not_called()
 
 
+def _toy_quantized_model(hidden, group_size, bits, mode, seed=11):
+    """One-block model whose single Linear is quantized in ``mode``.
+
+    Returns (model, proj) so the test can inspect the module the perturbation
+    loop mutates. Defined inside the function so the file still imports
+    without MLX.
+    """
+
+    class _Block(nn.Module):
+        def __init__(self, proj):
+            super().__init__()
+            self.proj = proj
+
+        def __call__(self, x, mask=None, cache=None, position_ids=None):
+            return x + self.proj(x)
+
+    class _Inner(nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(64, hidden)
+            self.layers = layers
+
+    class _Toy(nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.model = _Inner(layers)
+
+    # Explicit key rather than mx.random.seed: no global RNG state to leak
+    # into whichever test runs next.
+    weight = mx.random.normal((hidden, hidden), key=mx.random.key(seed)).astype(
+        mx.bfloat16
+    )
+    proj = nn.QuantizedLinear(
+        hidden, hidden, bias=False, group_size=group_size, bits=bits, mode=mode
+    )
+    packed = mx.quantize(weight, group_size=group_size, bits=bits, mode=mode)
+    proj.weight, proj.scales = packed[0], packed[1]
+    proj.biases = packed[2] if len(packed) > 2 else None
+    mx.eval(proj.weight, proj.scales)
+    return _Toy([_Block(proj)]), proj
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestMeasureSensitivityQuantizedGroupSize:
+    """The perturbation loop re-quantizes with mode="affine", whose kernels
+    only implement group sizes 32/64/128. nvfp4 source modules carry
+    group_size=16, so reusing the module's own size raised ValueError out of
+    mx.quantize and killed the whole quantization job (issue 2354).
+    """
+
+    def _measure(self, monkeypatch, model):
+        from omlx import oq as oq_mod
+
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.utils.model_loading",
+            MagicMock(
+                maybe_apply_pre_load_patches=MagicMock(),
+                _has_mtp_heads=MagicMock(return_value=False),
+                _checkpoint_has_mtp_weights=MagicMock(return_value=False),
+                lm_load_compat=MagicMock(return_value=(model, MagicMock())),
+            ),
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "omlx.patches.mlx_lm_mtp",
+            MagicMock(apply_mlx_lm_mtp_patch=MagicMock(return_value=False)),
+        )
+        monkeypatch.setattr(
+            oq_mod,
+            "_load_calibration_data",
+            MagicMock(return_value=mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])),
+        )
+        return oq_mod._measure_sensitivity_from_quantized_model("/fake/proxy", {}, 4)
+
+    def test_nvfp4_source_is_measured_and_restored(self, monkeypatch):
+        model, proj = _toy_quantized_model(64, 16, 4, "nvfp4")
+        weight_before, scales_before = proj.weight, proj.scales
+
+        result = self._measure(monkeypatch, model)
+
+        # A score at all means mx.quantize accepted the perturbation *and*
+        # the perturbed forward ran: _forward_layer_result swallows ValueError,
+        # so a module left claiming group_size=16 with affine weights would
+        # drop the layer from the map instead of raising.
+        assert set(result) == {0}
+        assert result[0] > 0
+        # Every quantization attribute is back on the source module, or the
+        # next layer's baseline forward would run on a perturbed one.
+        assert (proj.group_size, proj.bits, proj.mode) == (16, 4, "nvfp4")
+        assert mx.array_equal(proj.weight, weight_before)
+        assert mx.array_equal(proj.scales, scales_before)
+        # nvfp4 has no zero point; the affine perturbation's biases must not
+        # survive the restore.
+        assert proj.get("biases") is None
+
+    @pytest.mark.parametrize("group_size", [32, 64])
+    def test_affine_source_behaviour_is_unchanged(self, monkeypatch, group_size):
+        model, proj = _toy_quantized_model(128, group_size, 8, "affine")
+        weight_before, scales_before, biases_before = (
+            proj.weight,
+            proj.scales,
+            proj.biases,
+        )
+
+        result = self._measure(monkeypatch, model)
+
+        assert set(result) == {0}
+        assert result[0] > 0
+        assert (proj.group_size, proj.bits, proj.mode) == (group_size, 8, "affine")
+        assert mx.array_equal(proj.weight, weight_before)
+        assert mx.array_equal(proj.scales, scales_before)
+        assert mx.array_equal(proj.biases, biases_before)
+
+    def test_row_no_affine_group_size_divides_is_skipped(self, monkeypatch):
+        # 48 is a legal nvfp4 row (48 % 16 == 0) but no affine group size
+        # divides it, so clamping alone would trade one mx.quantize ValueError
+        # for another ("last dimension ... divisible by 32"). The module is
+        # left alone instead, which shows up as a zero score for the layer.
+        model, proj = _toy_quantized_model(48, 16, 4, "nvfp4")
+        weight_before = proj.weight
+
+        result = self._measure(monkeypatch, model)
+
+        assert set(result) == {0}
+        assert result[0] == 0.0
+        assert (proj.group_size, proj.bits, proj.mode) == (16, 4, "nvfp4")
+        assert mx.array_equal(proj.weight, weight_before)
+
+
 # =============================================================================
 # Test pre-computed sensitivity map loading (oq_sensitivity_map.json)
 # =============================================================================
@@ -5979,6 +6491,149 @@ class TestInklingSanitizeDiscovery:
         np.testing.assert_array_equal(up, ref[:, :, 1, :])
         scale = np.asarray(materialized.pop(prefix + "gate_scale"))
         np.testing.assert_array_equal(scale, np.ones(n_experts, dtype=np.float32))
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestQwen4ExpLayerWalk:
+    def test_trunk_and_mtp_imatrix_hooks_execute(self, tmp_path):
+        from tests.test_mlx_vlm_qwen4_exp_compat import _tiny_config
+
+        config = _tiny_config()
+        from mlx_vlm.models.qwen4_exp.language import configure_mtp_runtime
+        from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
+        from omlx.oq import _collect_mtp_head_imatrix
+
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"mtp.fc_hidden.weight": "model.safetensors"}}),
+            encoding="utf-8",
+        )
+        configure_mtp_runtime(tmp_path, enabled=True)
+        try:
+            model = Model(config)
+            tokens = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
+            layers = model.language_model.model.layers
+            inputs = model.language_model.model.embed_tokens(tokens)
+            inputs, masks, state = _prepare_layer_inputs(
+                model, layers, tokens, inputs
+            )
+
+            assert inputs.shape == (1, 6, 64)
+            assert state["kind"] == "qwen4_exp"
+            assert masks[0] is None
+            assert masks[1] is not None
+
+            collector = OQImatrixCollector()
+            assert collector.install(model) > 0
+            try:
+                for layer_idx, layer in enumerate(layers):
+                    inputs, _ = _forward_layer_result(
+                        layer,
+                        inputs,
+                        masks[layer_idx],
+                        state,
+                        layer_idx=layer_idx,
+                    )
+                    mx.eval(inputs)
+                assert _collect_mtp_head_imatrix(model, tokens, inputs)
+                assert any(
+                    name.startswith("language_model.model.layers.")
+                    for name in collector.entries
+                )
+                assert "mtp.fc_embedding" in collector.entries
+                assert any(
+                    name.startswith("mtp.layers.0.mlp.switch_mlp.")
+                    for name in collector.entries
+                )
+            finally:
+                collector.restore(model)
+        finally:
+            configure_mtp_runtime(tmp_path, enabled=False)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestGlm5NextLayerWalk:
+    def test_cache_without_checkpoint_mtp_weights_is_reusable(self, tmp_path):
+        from omlx.oq import OQImatrixData, _oqe_cache_missing_mtp_entries
+
+        cache = OQImatrixData(entries={}, metadata={}, path="unused.npz")
+        config = {
+            "model_type": "glm5_next",
+            "text_config": {"num_nextn_predict_layers": 1},
+        }
+
+        assert not _oqe_cache_missing_mtp_entries(cache, config, str(tmp_path))
+
+    def test_cache_signature_tracks_glm5_next_layer_walk(self, tmp_path):
+        signature = _source_imatrix_signature(
+            tmp_path,
+            {
+                "model_type": "glm5_next",
+                "text_config": {"model_type": "glm5_next_text"},
+            },
+            num_samples=128,
+            seq_length=512,
+            calib_dataset="test",
+        )
+
+        assert signature["layer_walk"] == "glm5_next_hc_moe_lm_head_v3"
+
+    def test_hyper_connections_and_moe_imatrix_hooks_execute(self):
+        from omlx.patches import mlx_vlm_glm5_next_compat
+        from omlx.oq import _collect_glm5_next_lm_head_imatrix
+        from tests.test_mlx_vlm_glm5_next_compat import _tiny_config
+
+        mlx_vlm_glm5_next_compat.apply_mlx_vlm_glm5_next_compat_patch()
+        from mlx_vlm.models.glm5_next import Model
+
+        config = _tiny_config()
+        config.text_config.n_routed_experts = 4
+        config.text_config.n_shared_experts = 1
+        config.text_config.first_k_dense_replace = 1
+        config.text_config.mlp_layer_types = ["dense", "sparse"]
+        model = Model(config)
+        tokens = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
+        layers = model.language_model.model.layers
+        inputs = model.language_model.model.embed_tokens(tokens)
+        inputs, masks, state = _prepare_layer_inputs(model, layers, tokens, inputs)
+
+        assert inputs.shape == (1, 6, 2, 32)
+        assert state["kind"] == "glm5_next"
+        assert masks[0] is None
+        assert masks[1] is not None
+
+        collector = OQImatrixCollector()
+        linear_attention = layers[0].self_attn
+        assert linear_attention.fuse_in
+        assert collector.install(model) > 0
+        assert not linear_attention.fuse_in
+        try:
+            for layer_idx, layer in enumerate(layers):
+                inputs, _ = _forward_layer_result(
+                    layer,
+                    inputs,
+                    masks[layer_idx],
+                    state,
+                    layer_idx=layer_idx,
+                )
+                mx.eval(inputs)
+
+            assert _collect_glm5_next_lm_head_imatrix(model, inputs, collector)
+            switch_entries = {
+                name: entry
+                for name, entry in collector.entries.items()
+                if ".switch_mlp." in name
+            }
+            assert switch_entries
+            assert "language_model.lm_head" in collector.entries
+            assert "language_model.model.layers.0.self_attn.b_proj" in collector.entries
+            embed_q = "language_model.model.layers.1.self_attn.embed_q"
+            assert embed_q in collector.entries
+            assert collector.entries[embed_q].counts.shape == (2,)
+            assert all(entry.counts.shape == (4,) for entry in switch_entries.values())
+            assert all(int(entry.counts.sum()) > 0 for entry in switch_entries.values())
+        finally:
+            collector.restore(model)
+        assert linear_attention.fuse_in
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")

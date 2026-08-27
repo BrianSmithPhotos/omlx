@@ -492,6 +492,27 @@ class TestVlmMtpPreLoadDispatch:
         stub = sys.modules["omlx.patches.mlx_lm_mtp"]
         stub.set_mtp_depth.assert_called_once_with(8)
 
+    def test_gemma4_unified_merged_assistant_dispatch(self, tmp_path, monkeypatch):
+        # Unified Gemma 4 exports share the Gemma 4 language runtime but use
+        # their own top-level config and TextConfig subclass.
+        calls, sanitize_mock, runtime_mock, attach_mock = self._stub_patches(
+            monkeypatch
+        )
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "gemma4_unified", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 4}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        sanitize_mock.assert_called_once()
+        runtime_mock.assert_called_once()
+        attach_mock.assert_called_once_with(True)
+        assert calls == ["attach=True", "sanitize", "runtime"]
+
     def test_gemma4_explicit_depth_overrides_default(self, tmp_path, monkeypatch):
         self._stub_patches(monkeypatch)
         path = _write_config(
@@ -780,6 +801,26 @@ class TestExpandPerLayerQuantKeys:
 
 
 class TestMaterializeLazyState:
+    def test_evaluates_arrays_in_bounded_chunks(self, monkeypatch):
+        import mlx.core as mx
+        import mlx.nn as nn
+
+        class _Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.tensor_list = [mx.array(i) * 2 for i in range(17)]
+
+        chunk_sizes = []
+        monkeypatch.setattr(
+            model_loading.mx,
+            "eval",
+            lambda arrays: chunk_sizes.append(len(arrays)),
+        )
+
+        model_loading.materialize_lazy_state(_Model())
+
+        assert chunk_sizes == [8, 8, 1]
+
     def test_covers_arrays_in_plain_helper_objects(self):
         """Lazy arrays hidden in non-Module helpers must be materialized.
 

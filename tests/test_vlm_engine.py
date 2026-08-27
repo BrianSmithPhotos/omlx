@@ -12,6 +12,7 @@ Tests cover:
 
 import base64
 import io
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -175,6 +176,102 @@ class TestVLMStreamingCleanup:
         assert len(outputs) == 1
         assert outputs[0].generated_at == 10.0
         assert outputs[0].generated_until == 12.0
+
+
+class TestVLMToolForwarding:
+    """Tool schemas must reach scheduler requests on both chat paths."""
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "Write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                },
+            },
+        }
+    ]
+
+    @staticmethod
+    def _process_chat_messages(*args):
+        return "prompt", None, {}, None, 0, []
+
+    @staticmethod
+    def _output(*, streaming=False):
+        return SimpleNamespace(
+            output_text="ok",
+            new_text="ok" if streaming else "",
+            prompt_tokens=1,
+            completion_tokens=1,
+            finished=streaming,
+            finish_reason="stop",
+            tool_calls=None,
+            cached_tokens=0,
+            first_token_at=None,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_chat_forwards_tools_to_core_generate(self):
+        executor = ThreadPoolExecutor(max_workers=1)
+        core = SimpleNamespace(
+            _mlx_executor=executor,
+            generate=AsyncMock(return_value=self._output()),
+        )
+        engine = _make_loaded_engine(model_type="muse_glimmer")
+        engine._engine = core
+
+        try:
+            with patch.object(
+                engine,
+                "_process_chat_messages",
+                side_effect=self._process_chat_messages,
+            ):
+                await engine.chat(
+                    [{"role": "user", "content": "write json"}], tools=self.tools
+                )
+        finally:
+            executor.shutdown(wait=False)
+
+        assert core.generate.call_args.kwargs["tools"] == self.tools
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_stream_chat_forwards_tools_to_core_request(self):
+        executor = ThreadPoolExecutor(max_workers=1)
+
+        async def stream_outputs(request_id):
+            yield self._output(streaming=True)
+
+        core = SimpleNamespace(
+            _mlx_executor=executor,
+            add_request=AsyncMock(return_value="request-1"),
+            stream_outputs=stream_outputs,
+            abort_request=AsyncMock(return_value=True),
+        )
+        engine = _make_loaded_engine(model_type="muse_glimmer")
+        engine._engine = core
+
+        try:
+            with patch.object(
+                engine,
+                "_process_chat_messages",
+                side_effect=self._process_chat_messages,
+            ):
+                async for _ in engine.stream_chat(
+                    [{"role": "user", "content": "write json"}], tools=self.tools
+                ):
+                    pass
+        finally:
+            executor.shutdown(wait=False)
+
+        assert core.add_request.call_args.kwargs["tools"] == self.tools
 
 
 class TestVLMDiffusionLane:
@@ -1167,7 +1264,6 @@ class TestProcessChatMessages:
         call_kwargs = engine._prepare_vision_inputs.call_args[1]
         assert call_kwargs["tools"] is None
 
-
 # ---------------------------------------------------------------------------
 # TestPrepareVisionInputs
 # ---------------------------------------------------------------------------
@@ -1506,6 +1602,58 @@ class TestFormatMessagesForVLMTemplate:
         # User message with image should be list
         assert isinstance(formatted[1]["content"], list)
         assert self._count_image_placeholders([formatted[1]]) == 1
+
+    def test_glm5_next_preserves_image_parts_for_native_template(self):
+        """GLM-5.3 image parts must survive mlx-vlm's generic fallback."""
+        engine = _make_loaded_engine(model_type="glm5_next")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Before"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc"},
+                    },
+                    {"type": "text", "text": "After"},
+                ],
+            }
+        ]
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            messages, num_images=1
+        )
+
+        assert formatted == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Before"},
+                    {"type": "image"},
+                    {"type": "text", "text": "After"},
+                ],
+            }
+        ]
+        assert image_ranges == [(0, 1)]
+
+    def test_glm5_next_inserts_fallback_image_marker(self):
+        """Legacy GLM callers with separate images still receive a marker."""
+        engine = _make_loaded_engine(model_type="glm5_next")
+
+        formatted, image_ranges = engine._format_messages_for_vlm_template(
+            [{"role": "user", "content": "Describe this"}], num_images=1
+        )
+
+        assert formatted == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": "Describe this"},
+                ],
+            }
+        ]
+        assert image_ranges == [(0, 1)]
 
     def test_reasoning_content_preserved_verbatim(self):
         """Assistant messages with reasoning_content must skip get_message_json.
@@ -2411,8 +2559,6 @@ class TestVLMEngineFrequencyPenalty:
     async def test_chat_forwards_frequency_penalty_to_generate(self):
         """chat() forwards **kwargs into generate(), so the server's
         frequency_penalty kwarg must survive the chat -> generate chain."""
-        from concurrent.futures import ThreadPoolExecutor
-
         engine = _make_loaded_engine(model_type="test-vlm")
         mlx_executor = ThreadPoolExecutor(max_workers=1)
         engine._engine = SimpleNamespace(

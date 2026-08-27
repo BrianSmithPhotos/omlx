@@ -48,7 +48,12 @@ def test_distributed_inference_is_an_advanced_restart_scoped_opt_in():
     settings = _read("omlx/admin/templates/dashboard/_settings.html")
     javascript = _read("omlx/admin/static/js/dashboard.js")
 
+    distributed_section = settings.index("<!-- Distributed inference subsection -->")
+    performance_section = settings.index("<!-- Performance subsection -->")
+
+    assert distributed_section < performance_section
     assert "settings.advanced.distributed_inference" in settings
+    assert "settings.advanced.distributed_inference_enabled" in settings
     assert "settings.advanced.distributed_inference_hint" in settings
     assert "distributed_inference_enabled: false" in javascript
     assert "distributed_inference_active: false" in javascript
@@ -104,6 +109,7 @@ def test_cuda_workers_join_from_a_gui_generated_one_time_command():
     assert "async revokeClusterJoinCommand()" in javascript
     assert "/admin/api/cluster/join-keys" in javascript
     assert "/admin/api/cluster/join-status" in javascript
+    assert "ttl_seconds: 1800" in javascript
     assert "service: 'oMLX CUDA Worker'" in javascript
     assert "selected.set(peer.ssh, peer)" in javascript
     # The command contains the one-time credential and therefore stays only
@@ -139,7 +145,7 @@ def test_cluster_dashboard_names_roles_and_uses_detected_topology():
     assert "clusterTopologySummary()" in cluster
     assert "Physical peer detected" not in cluster
     assert "Ports detected" not in cluster
-    assert "async initializeClusterSetup()" in javascript
+    assert "async initializeClusterSetup({ preview = true } = {})" in javascript
     assert "this.loadClusterKnownNodes();" in javascript
     assert "omlx.cluster.knownNodes" in javascript
     assert "Cached nodes are display hints only" in javascript
@@ -355,7 +361,10 @@ def test_cluster_nodes_show_dynamic_hardware_identity_for_every_peer():
     assert "async loadClusterPeerHardware()" in javascript
     assert "await this.loadClusterPeerHardware()" in javascript
     assert "result.bootstrap_required" in javascript
-    assert "worker runtime is not installed yet" in javascript
+    # #2680: the banner must repeat what the probe measured, not assert
+    # "not installed" over a runtime it was merely unable to check.
+    assert "result.runtime_mismatches" in javascript
+    assert "its oMLX worker runtime is not installed yet" in javascript
     assert "probe?.ssh_reachable" in javascript
     assert "this.clusterPeerProbes?.[ssh]" in javascript
     assert "hardware.chip_name" in javascript
@@ -454,6 +463,9 @@ def test_pairing_failure_exposes_omlx_and_terminal_recovery_paths():
     assert "t('cluster.pairing.shared_secret_hint')" in cluster
     assert "data-cluster-ssh-setup" in cluster
     assert "openClusterPairingSetup()" in javascript
+    assert "Regenerating this key disconnects every paired worker" in javascript
+    assert "?overwrite=true" in javascript
+    assert "Regenerating disconnects every paired worker" in cluster
 
 
 def test_every_dashboard_locale_names_cluster_tab():
@@ -461,6 +473,7 @@ def test_every_dashboard_locale_names_cluster_tab():
     required = {
         "navbar.tab.cluster",
         "settings.advanced.distributed_inference",
+        "settings.advanced.distributed_inference_enabled",
         "settings.advanced.distributed_inference_hint",
         "cluster.pairing.shared_secret",
         "cluster.pairing.shared_secret_hint",

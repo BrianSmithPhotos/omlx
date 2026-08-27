@@ -81,6 +81,58 @@ class TestListModelsSettings:
         assert settings_dict["max_tokens"] == 4096
         assert settings_dict["temperature"] == 0.7
 
+    def test_list_models_reports_forced_qwen4_ple_offload(self, tmp_path):
+        from omlx.patches.mlx_vlm_qwen4_exp_compat.residency import (
+            Qwen4ExpResidencyEstimate,
+        )
+
+        model_path = tmp_path / "qwen4"
+        model_path.mkdir()
+        estimate = Qwen4ExpResidencyEstimate(
+            supported=True,
+            checkpoint_bytes=950,
+            ple_bytes=550,
+            resident_bytes=1000,
+            mmap_bytes=400,
+        )
+        pool = MagicMock()
+        pool.get_status.return_value = {
+            "models": [
+                {
+                    "id": "qwen4",
+                    "model_path": str(model_path),
+                    "config_model_type": "qwen4_exp",
+                    "estimated_size": 1000,
+                }
+            ]
+        }
+        pool._fallback_admission_ceiling.return_value = 500
+        manager = MagicMock()
+        manager.get_all_settings.return_value = {}
+        state = MagicMock(default_model=None)
+
+        with (
+            patch.object(admin_routes, "_get_engine_pool", return_value=pool),
+            patch.object(admin_routes, "_get_settings_manager", return_value=manager),
+            patch.object(admin_routes, "_get_server_state", return_value=state),
+            patch.object(admin_routes, "_get_global_settings", return_value=None),
+            patch.object(admin_routes, "_dflash_compat_for_model", return_value=(False, "")),
+            patch.object(admin_routes, "_mtp_compat_for_model", return_value=(False, "")),
+            patch.object(admin_routes, "_paroquant_compat_for_model", return_value=(False, "")),
+            patch(
+                "omlx.patches.mlx_vlm_qwen4_exp_compat.residency."
+                "qwen4_exp_residency_estimate",
+                return_value=estimate,
+            ),
+        ):
+            result = asyncio.run(admin_routes.list_models(is_admin=True))
+
+        model = result["models"][0]
+        assert model["qwen4_ple_ssd_offload_supported"] is True
+        assert model["qwen4_ple_ssd_offload_forced"] is True
+        assert model["qwen4_ple_resident_bytes"] == 1000
+        assert model["qwen4_ple_mmap_bytes"] == 400
+
     def test_list_models_adds_display_name_without_changing_id(self, tmp_path):
         """Ensure nested model paths only affect UI display names."""
         model_root = tmp_path / "models"
@@ -916,42 +968,20 @@ class TestRuntimeCacheObservability:
         assert payload["total_num_files"] == 10
         assert payload["total_size_bytes"] == 12288
         assert payload["effective_block_sizes"] == [1024, 2048]
-        assert payload["models"] == [
-            {
-                "id": "model-a",
-                "block_size": 1024,
-                "indexed_blocks": 12,
-                "indexed_blocks_display": "12",
-                "has_sub_block_cache": False,
-                "partial_block_skips": 0,
-                "partial_tokens_skipped": 0,
-                "last_partial_tokens_skipped": 0,
-                "last_tokens_to_next_block": 0,
-                "num_files": 3,
-                "total_size_bytes": 4096,
-                "max_size_bytes": 0,
-                "hot_cache_max_bytes": 0,
-                "hot_cache_size_bytes": 0,
-                "hot_cache_entries": 0,
-            },
-            {
-                "id": "model-b",
-                "block_size": 2048,
-                "indexed_blocks": 4,
-                "indexed_blocks_display": "4",
-                "has_sub_block_cache": False,
-                "partial_block_skips": 0,
-                "partial_tokens_skipped": 0,
-                "last_partial_tokens_skipped": 0,
-                "last_tokens_to_next_block": 0,
-                "num_files": 7,
-                "total_size_bytes": 8192,
-                "max_size_bytes": 0,
-                "hot_cache_max_bytes": 0,
-                "hot_cache_size_bytes": 0,
-                "hot_cache_entries": 0,
-            },
-        ]
+        rows = {row["id"]: row for row in payload["models"]}
+        assert rows["model-a"]["block_size"] == 1024
+        assert rows["model-a"]["indexed_blocks"] == 12
+        assert rows["model-a"]["num_files"] == 3
+        assert rows["model-a"]["total_size_bytes"] == 4096
+        assert rows["model-b"]["block_size"] == 2048
+        assert rows["model-b"]["indexed_blocks"] == 4
+        assert rows["model-b"]["num_files"] == 7
+        assert rows["model-b"]["total_size_bytes"] == 8192
+        for row in rows.values():
+            assert row["gdn_checkpoint_loads"] == 0
+            assert row["gdn_checkpoint_walkbacks"] == 0
+            assert row["gdn_last_restore"] is None
+            assert row["gdn_staging"]["sidecar_count"] == 0
         manager_a.get_stats_for_model.assert_called_once_with("/models/model-a")
         manager_b.get_stats_for_model.assert_called_once_with("/models/model-b")
 

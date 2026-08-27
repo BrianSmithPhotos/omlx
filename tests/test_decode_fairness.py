@@ -160,6 +160,29 @@ class TestContendedChunkCap:
         assert s._prefill_step_size_for_progress(0, 100000) == 256
 
 
+class TestQwen35PrefillFloor:
+    """Qwen3.5/3.6 chunk floor (measured +3.2% prefill at 4k on the 27B)."""
+
+    def test_floor_applies(self):
+        s = _make_scheduler()
+        s._qwen35_prefill_floor = 4096
+        assert s._prefill_step_size_for_progress(0, 100000) == 4096
+
+    def test_contended_cap_still_wins(self):
+        s = _make_scheduler()
+        s._qwen35_prefill_floor = 4096
+        s.running = {"r1": MagicMock()}
+        assert (
+            s._prefill_step_size_for_progress(0, 100000)
+            == _CONTENDED_PREFILL_CHUNK
+        )
+
+    def test_non_qwen_model_unaffected(self):
+        s = _make_scheduler()
+        assert s._qwen35_prefill_floor == 0
+        assert s._prefill_step_size_for_progress(0, 100000) == 2048
+
+
 class TestAdaptiveChunkCap:
     """Contended chunks are sized by stall time x measured prefill tps."""
 
@@ -178,8 +201,8 @@ class TestAdaptiveChunkCap:
     def test_cap_stays_on_64_grid(self):
         s = _make_scheduler()
         s.running = {"r1": MagicMock()}
-        # The DSv4 native indexer requires chunk length % 64 == 0; an
-        # arbitrary tps must never produce an unaligned cap (e.g. 297).
+        # Keep scheduler chunk sizing stable even though model-specific native
+        # kernels now handle partial tiles internally.
         for tps in (594.0, 733.0, 999.0, 1601.0, 5000.0):
             s._prefill_tps_best = tps
             assert s._contended_prefill_cap() % 64 == 0

@@ -5,6 +5,7 @@
     const DSA_MODEL_TYPES = new Set([
         'deepseek_v32', 'glm_moe_dsa',
     ]);
+    const QWEN35_ANE_CONFIG_PREFIXES = ['qwen3_5', 'qwen3_6', 'qwen3_8'];
     const DIFFUSION_CONFIG_MODEL_TYPES = new Set([
         'diffusion_gemma',
     ]);
@@ -27,6 +28,22 @@
         'turboquant_kv_enabled',
         'turboquant_kv_bits',
         'turboquant_skip_last',
+        'qwen35_ane_prefill_enabled',
+        'qwen35_ane_prefill_sequence_length',
+        'qwen35_ane_prefill_tail_padding_min_tokens',
+        'qwen35_ane_prefill_fraction',
+        'qwen35_ane_prefill_fused_down',
+        'qwen35_ane_prefill_max_layers',
+        'qwen35_ane_prefill_dual_ane',
+        'qwen35_ane_prefill_gdn',
+        'qwen35_ane_prefill_gdn_fraction',
+        'qwen35_ane_prefill_gdn_max_layers',
+        'qwen35_ane_prefill_cpu_enabled',
+        'qwen35_ane_prefill_cpu_fraction',
+        'qwen35_ane_prefill_cpu_down_fraction',
+        'qwen35_ane_prefill_cpu_gdn_fraction',
+        'qwen35_ane_prefill_cpu_threads',
+        'qwen35_ane_prefill_cpu_shared_resource',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -45,6 +62,7 @@
         'dflash_ssd_cache_max_bytes',
         'dflash_draft_window_size',
         'dflash_draft_sink_size',
+        'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
         'vlm_mtp_enabled',
@@ -55,6 +73,9 @@
         'enable_thinking',
         'reasoning_effort',
         'preserve_thinking',
+    ]);
+    const REASONING_EFFORT_PRESETS = new Set([
+        'low', 'medium', 'high', 'xhigh', 'max',
     ]);
     const VLM_MTP_DRAFTER_CONFIG_MODEL_TYPES = new Set([
         'gemma4_assistant',
@@ -71,6 +92,8 @@
     const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
+    const THEME_STORAGE_KEY = 'omlx-chat-theme';
+    const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
 
     // Default sort for the settings and manager model tables. Also the target
     // state for the "reset sort" action.
@@ -80,9 +103,10 @@
     function dashboard() {
         return {
             // Theme
-            theme: localStorage.getItem('omlx-chat-theme') || 'auto',
+            theme: localStorage.getItem(THEME_STORAGE_KEY) || 'auto',
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
+            enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
 
             // Mobile menu
             mobileMenuOpen: false,
@@ -97,13 +121,13 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', initial_cache_blocks: 256, hot_cache_only: false },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
-                mcp: { config_path: '' },
+                mcp: { config_path: '', expose_tools: true },
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
                 auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
@@ -198,12 +222,48 @@
                 max_tool_result_tokens: null,
                 ctKwargEntries: [],
                 is_diffusion_model: false,
+                qwen35_ane_prefill_enabled: false,
+                qwen35_ane_prefill_sequence_length: 2048,
+                qwen35_ane_prefill_tail_padding_min_tokens: 0,
+                qwen35_ane_prefill_fraction: 0.53,
+                qwen35_ane_prefill_fused_down: false,
+                qwen35_ane_prefill_max_layers: 64,
+                qwen35_ane_prefill_dual_ane: true,
+                qwen35_ane_prefill_gdn: true,
+                qwen35_ane_prefill_gdn_fraction: 0.5,
+                qwen35_ane_prefill_gdn_max_layers: 48,
+                qwen35_ane_prefill_cpu_enabled: false,
+                qwen35_ane_prefill_cpu_fraction: 0.135,
+                qwen35_ane_prefill_cpu_down_fraction: 0,
+                qwen35_ane_prefill_cpu_gdn_fraction: 0,
+                qwen35_ane_prefill_cpu_threads: 8,
+                qwen35_ane_prefill_cpu_shared_resource: true,
                 trust_remote_code: false,
             },
             savingModelSettings: false,
             importingMtplx: false,
             loadingGenDefaults: false,
             reasoningParsers: [],
+            aneTuning: {
+                tuningId: null,
+                modelId: null,
+                running: false,
+                cancelling: false,
+                applying: false,
+                applied: false,
+                total: 0,
+                status: null,
+                error: '',
+            },
+            aneTuningOverrides: {
+                allowCpu: true,
+                allowCpuGate: true,
+                allowCpuDown: true,
+                allowAneGdn: true,
+                allowCpuGdn: true,
+                allowCpuSharedResource: true,
+            },
+            _aneTuningPollTimer: null,
 
             // Profile / template / preset state
             profiles: [],                // per-model profiles for selectedModel
@@ -307,6 +367,13 @@
             clusterPlanTensorParallelSize: 1,
             clusterPeerHealth: null,
             clusterPeerHealthLoading: false,
+            // Server-owned incident feed. Polls merge by id and never delete:
+            // the only paths that change a row are new server records (via the
+            // since cursor) and an explicit dismissal round-trip.
+            clusterIncidents: [],
+            _clusterIncidentSeq: 0,
+            _clusterIncidentsById: null,
+            _clusterIncidentEpoch: '',
             clusterStagingResult: null,
             clusterStagingLoading: false,
             clusterGuidance: null,
@@ -644,6 +711,7 @@
             // Benchmark state
             benchModelId: '',
             benchContextProfile: 'code_python',
+            benchAlignPromptToAne: false,
             benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false, 131072: false, 200000: false },
             benchBatchSizes: { 2: true, 4: true, 8: false },
             benchForceLmEngine: false,
@@ -748,6 +816,10 @@
             accExternalEnabled: false,
             // Provider-specific JSON is intentionally session-only.
             accExternalExtraBody: '',
+            // Accuracy-only max_tokens floor; persisted like the shared
+            // endpoint settings because it is a simple number the user sets
+            // once per endpoint (thinking models need a larger budget).
+            accExternalMaxTokens: localStorage.getItem('omlx_acc_external_max_tokens') || '',
             accRunning: false,
             accCurrentModel: '',
             accCurrentBenchId: null,
@@ -1024,8 +1096,9 @@
                 this.clusterShowPeerAdvanced = true;
                 if (!this.clusterSshKey) await this.loadClusterSshKey();
                 await this.$nextTick();
+                const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
                 document.querySelector('[data-cluster-ssh-setup]')?.scrollIntoView({
-                    behavior: 'smooth',
+                    behavior: reduced ? 'auto' : 'smooth',
                     block: 'center',
                 });
             },
@@ -1144,6 +1217,9 @@
                     }
                     if (nodes.some(node => !previousIds.has(node.node_id))) {
                         this._clusterKnownNodesNeedsSync = true;
+                        // A newly joined node changes the topology, so its
+                        // budgets should be measured once on the next setup pass.
+                        this._clusterBudgetsMeasured = false;
                         this.saveClusterKnownNodes();
                     }
                     this.clusterJoinError = result.load_error || '';
@@ -1218,7 +1294,7 @@
                             controller_ip: controllerIp,
                             controller_port: port,
                             scheme: secure ? 'https' : 'http',
-                            ttl_seconds: 600,
+                            ttl_seconds: 1800,
                         }),
                     });
                     if (response.status === 401) {
@@ -1435,6 +1511,7 @@
             // four-node clusters grow automatically when another Mac starts.
             async refreshClusterExperience() {
                 await this.loadClusterRuntime();
+                await this.loadClusterIncidents();
                 this._clusterDiscoveryRefreshCounter += 1;
                 if (this._clusterDiscoveryRefreshCounter < 5) return;
                 this._clusterDiscoveryRefreshCounter = 0;
@@ -1442,7 +1519,107 @@
                     this.discoverClusterPeers(),
                     this.loadClusterJoinStatus(),
                 ]);
-                await this.initializeClusterSetup();
+                await this.initializeClusterSetup({ preview: false });
+            },
+
+            // Monotonic merge: the ?since= cursor means the server only ever
+            // sends records this browser has not seen, and the merge below
+            // only adds or updates Map entries — nothing on the poll path can
+            // delete a row, so no refresh can wipe error state (#8). The only
+            // removal is an explicit dismissal, which round-trips through the
+            // server so it also survives reloads.
+            async loadClusterIncidents() {
+                try {
+                    const since = this._clusterIncidentSeq || 0;
+                    const response = await fetch(`/admin/api/cluster/incidents?since=${since}`);
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) return;
+                    const payload = await response.json();
+                    // The epoch names the seq numbering. A corrupt-log reset
+                    // restarts seq at 1 under a new epoch; keeping the old
+                    // cursor there would silence the feed for this tab
+                    // forever, so restart the merge from scratch.
+                    if (payload.epoch && payload.epoch !== this._clusterIncidentEpoch) {
+                        if (this._clusterIncidentEpoch) {
+                            this._clusterIncidentSeq = 0;
+                            this._clusterIncidentsById = null;
+                        }
+                        this._clusterIncidentEpoch = payload.epoch;
+                    }
+                    const incidents = Array.isArray(payload.incidents) ? payload.incidents : [];
+                    if (!this._clusterIncidentsById) this._clusterIncidentsById = new Map();
+                    for (const incident of incidents) {
+                        if (incident && incident.id) {
+                            this._clusterIncidentsById.set(incident.id, incident);
+                        }
+                    }
+                    if (typeof payload.latest_seq === 'number' && payload.latest_seq > since) {
+                        this._clusterIncidentSeq = payload.latest_seq;
+                    }
+                    this.clusterIncidents = Array.from(this._clusterIncidentsById.values())
+                        .sort((a, b) => (b.seq || 0) - (a.seq || 0));
+                } catch (error) {
+                    // A failed poll must leave the existing incident state alone.
+                }
+            },
+
+            async dismissClusterIncident(incidentId) {
+                if (!incidentId) return;
+                try {
+                    const response = await fetch(
+                        `/admin/api/cluster/incidents/${encodeURIComponent(incidentId)}/dismiss`,
+                        { method: 'POST' },
+                    );
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) return;
+                    // Reflect the server's decision locally: the record keeps
+                    // its seq, so the cursor will not re-send it — update the
+                    // merged copy rather than waiting for a full reload.
+                    const existing = this._clusterIncidentsById
+                        ? this._clusterIncidentsById.get(incidentId)
+                        : null;
+                    if (existing && !existing.dismissed_at) {
+                        existing.dismissed_at = Date.now() / 1000;
+                        this.clusterIncidents = Array.from(this._clusterIncidentsById.values())
+                            .sort((a, b) => (b.seq || 0) - (a.seq || 0));
+                    }
+                } catch (error) {
+                    // Leave the row visible; dismissal is retryable.
+                }
+            },
+
+            clusterActiveIncidents() {
+                return (this.clusterIncidents || []).filter((incident) => !incident.dismissed_at);
+            },
+
+            clusterIncidentAge(ts) {
+                if (!ts) return '';
+                const seconds = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+                if (seconds < 60) return `${seconds}s ago`;
+                if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+                if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+                return `${Math.floor(seconds / 86400)}d ago`;
+            },
+
+            // The error-banner X posts a dismissal for the matching incident
+            // (when one exists) instead of only blanking client state, so the
+            // dismissal is server-owned and holds across browser reloads.
+            async dismissClusterErrorBanner() {
+                const displayed = this.clusterDisplayedError();
+                this.clusterError = '';
+                this.clusterConnectionError = '';
+                this.dismissClusterGuidance();
+                if (!displayed) return;
+                const match = this.clusterActiveIncidents().find(
+                    (incident) => incident.message === displayed,
+                );
+                if (match) await this.dismissClusterIncident(match.id);
             },
 
             async runClusterWorkerSmoke() {
@@ -1598,14 +1775,34 @@
                     const status = result.status || {};
                     const node = status.node || {};
                     if (result.bootstrap_required) {
+                        // Repeat what the probe measured. This used to assert
+                        // "not installed" for every bootstrap_required result,
+                        // including peers whose runtime it merely could not
+                        // check — which is what surfaced the wrong guidance in
+                        // #2680.
+                        const measured = (result.runtime_mismatches || [])
+                            .find((entry) => Boolean(entry));
                         this.clusterConnectionError =
-                            `${node.hostname || ssh} is online, but its oMLX `
-                            + 'worker runtime is not installed yet.';
+                            `${node.hostname || ssh} is online, but `
+                            + (measured || 'its oMLX worker runtime is not installed yet.');
                         this.explainClusterError(this.clusterConnectionError);
                     }
                     if (this.clusterPlanNodes[1]) {
-                        this.clusterPlanNodes[1].ssh = ssh;
-                        this.clusterPlanNodes[1].node_id = node.hostname || this.clusterPlanNodes[1].node_id;
+                        const planned = this.clusterPlanNodes[1];
+                        const previousId = String(planned.ssh || '').trim() === ssh
+                            ? planned.node_id
+                            : '';
+                        const deployedId = (this.clusterDeployments?.[0]?.hosts || [])
+                            .find(host => host.ssh === ssh)?.node_id;
+                        const sshHostname = ssh.split('@').pop();
+                        planned.ssh = ssh;
+                        planned.node_id = this.clusterNodeId(
+                            deployedId,
+                            previousId,
+                            node.hostname,
+                            sshHostname,
+                            'worker-1',
+                        );
                         const exactCapacity = Number(
                             node.admission_ceiling_bytes
                             || node.recommended_working_set_bytes
@@ -1712,6 +1909,18 @@
             },
 
             syncClusterNodesFromPeers() {
+                // Don't let a background status poll rebuild the node set (and
+                // reset selections / invalidate the plan) while an activation is
+                // in flight — startCluster() runs a multi-step autoconfigure →
+                // stage → activate sequence and a mid-flight resync can discard
+                // its own in-progress proposal.
+                if (this.clusterAutoconfigureLoading
+                    || this.clusterActivationLoading
+                    || this.clusterLinkSetupLoading) {
+                    // Report the skip so callers holding a pending-sync flag
+                    // keep it armed for the next tick instead of dropping it.
+                    return false;
+                }
                 this.clusterModelInventory = null;
                 this.clusterCatalogue = null;
                 const gib = 1024 ** 3;
@@ -1729,7 +1938,17 @@
                         .filter(node => String(node.ssh || '').trim())
                         .map(node => [String(node.ssh).trim(), node])
                 );
-                const localName = this.clusterStatus?.node?.hostname || 'this-mac';
+                const deployedBySsh = new Map(
+                    (this.clusterDeployments?.[0]?.hosts || [])
+                        .filter(host => String(host.ssh || '').trim())
+                        .map(host => [String(host.ssh).trim(), host])
+                );
+                const localName = this.clusterNodeId(
+                    deployedBySsh.get('127.0.0.1')?.node_id,
+                    existingBySsh.get('127.0.0.1')?.node_id,
+                    this.clusterStatus?.node?.hostname,
+                    'this-mac',
+                );
                 const local = existingBySsh.get('127.0.0.1')
                     || existing.get(localName)
                     || this.clusterPlanNodes?.[0]
@@ -1746,7 +1965,7 @@
                         ? localCapacityBytes
                         : Number(local.capacity_bytes || 0),
                     reserve_gib: Number(local.reserve_gib || 0),
-                    role: 'workstation',
+                    role: local.role || 'workstation',
                     accelerator: this.clusterStatus?.node?.accelerator || 'metal',
                     accelerator_vendor:
                         this.clusterStatus?.node?.accelerator_vendor || 'apple',
@@ -1761,18 +1980,25 @@
                         this.clusterStatus?.runtime?.python_executable || '',
                 }];
                 this.clusterWorkerPeers().forEach((peer, index) => {
-                    const nodeId = this.clusterFriendlyMacName(
-                        peer.name || peer.ssh,
+                    const previousBySsh = existingBySsh.get(peer.ssh);
+                    const hardware = this.clusterPeerProbes?.[peer.ssh]?.status?.node || {};
+                    const sshHostname = String(peer.ssh || '').trim().split('@').pop();
+                    const nodeId = this.clusterNodeId(
+                        deployedBySsh.get(peer.ssh)?.node_id,
+                        peer.node_id,
+                        previousBySsh?.node_id,
+                        peer.name,
+                        hardware.hostname,
+                        sshHostname,
                         `worker-${index + 1}`,
                     );
                     const namedPrevious = existing.get(nodeId);
-                    const previous = existingBySsh.get(peer.ssh)
+                    const previous = previousBySsh
                         || (
                             namedPrevious && !String(namedPrevious.ssh || '').trim()
                                 ? namedPrevious
                                 : {}
                         );
-                    const hardware = this.clusterPeerProbes?.[peer.ssh]?.status?.node || {};
                     const peerRuntime = this.clusterPeerProbes?.[peer.ssh]?.status?.runtime || {};
                     const exactCapacityBytes = Number(
                         hardware.admission_ceiling_bytes
@@ -1836,28 +2062,47 @@
                         node.fabric_verified = false;
                     });
                 }
+                // Only invalidate a built plan when the node set actually
+                // changed. The 2s/10s cluster status poll calls this on every
+                // tick; invalidating unconditionally nulled clusterPlan and its
+                // signature, which dead-buttoned "Activate manual plan"
+                // (clusterActivationReady requires a non-null plan whose
+                // signature still matches) and erased error banners every poll.
+                // #2721 stopped the poll from POSTing /plan but left this
+                // client-side wipe in place.
+                const nodesChanged =
+                    JSON.stringify(nodes)
+                    !== JSON.stringify(this.clusterPlanNodes ?? []);
                 this.clusterPlanNodes = nodes;
                 this._clusterNodeKey = Math.max(
                     this._clusterNodeKey,
                     ...nodes.map(node => Number(node.key) || 0),
                 );
                 this.normalizeClusterTensorParallelSize();
-                this.invalidateClusterPlan();
+                if (nodesChanged) {
+                    this.invalidateClusterPlan();
+                }
+                return true;
             },
 
             // Turn every unambiguous fast-link discovery into the default
             // cluster. A deployment remains authoritative on restart; without
             // one, all RDMA peers are selected instead of forcing a three-Mac
             // user to choose one and silently ignore the rest.
-            async initializeClusterSetup() {
+            async initializeClusterSetup({ preview = true } = {}) {
                 const deployment = (this.clusterDeployments || [])[0] || null;
                 if (
                     this._clusterKnownNodesNeedsSync
                     && this.clusterStatus
                     && this.clusterWorkerPeers().length
                 ) {
-                    this.syncClusterNodesFromPeers();
-                    this._clusterKnownNodesNeedsSync = false;
+                    // Clear the flag only when the sync actually ran: it
+                    // skips itself during activation loads, and dropping the
+                    // flag on a skipped run lost the joining node until the
+                    // next join event re-armed it.
+                    if (this.syncClusterNodesFromPeers() === true) {
+                        this._clusterKnownNodesNeedsSync = false;
+                    }
                 }
                 if (!this.clusterWorkerPeers().length) {
                     const deployedPeers = (deployment?.hosts || []).filter(
@@ -1908,7 +2153,8 @@
                 // While the probe is backing off after failures, budgets would
                 // fail over the same SSH path, so they wait for the same hold.
                 if (this.clusterWorkerPeers().length
-                        && !this.clusterProbeBackoffActive()) {
+                        && !this.clusterProbeBackoffActive()
+                        && !this._clusterBudgetsMeasured) {
                     await this.measureClusterBudgets();
                 }
 
@@ -1970,7 +2216,7 @@
                     if (recommended) this.selectClusterModel(recommended);
                 }
                 this.normalizeClusterTensorParallelSize();
-                await this.previewClusterWeightBalance();
+                if (preview) await this.previewClusterWeightBalance();
             },
 
             // 2-second "Copied!" affordance on the exchange token, matching
@@ -2063,15 +2309,30 @@
 
             async generateClusterSshKey() {
                 if (this.clusterSshKeyGenerating) return;
+                const overwrite = Boolean(this.clusterSshKey?.available);
+                if (overwrite && !window.confirm(
+                    'Regenerating this key disconnects every paired worker. '
+                    + 'You will need to exchange keys again on every Mac. Continue?'
+                )) return;
                 this.clusterSshKeyGenerating = true;
                 try {
-                    const response = await fetch('/admin/api/cluster/ssh-key/generate', {
+                    const endpoint = '/admin/api/cluster/ssh-key/generate'
+                        + (overwrite ? '?overwrite=true' : '');
+                    const response = await fetch(endpoint, {
                         method: 'POST',
                     });
                     if (response.ok) {
                         this.clusterSshKey = await response.json();
-                        // Show success notification
-                        this.showNotification('SSH key generated successfully', 'success');
+                        this.clusterExchangeToken = null;
+                        this.clusterPeerExchangeToken = '';
+                        this.clusterKeyExchangeResult = null;
+                        if (overwrite) this.invalidateClusterPeer(true);
+                        this.showNotification(
+                            overwrite
+                                ? 'SSH key regenerated. Pair every worker again before reconnecting.'
+                                : 'SSH key generated successfully',
+                            'success'
+                        );
                     } else {
                         const error = await response.json();
                         this.showNotification('SSH key generation failed: ' + (error.detail || 'Unknown error'), 'error');
@@ -2211,6 +2472,10 @@
                     this.clusterFabricError = '';
                     this.clusterIpsOverridden = false;
                 }
+                // A different peer is a different machine: its budgets must be
+                // re-measured once (the recurring poll skips already-measured
+                // topologies to avoid jitter).
+                this._clusterBudgetsMeasured = false;
                 this.invalidateClusterPlan();
             },
 
@@ -3183,7 +3448,7 @@
                     );
                 const fit = this.clusterCatalogueFit(model.model_path);
                 if (fit?.fits === true) {
-                    const tensorSize = Number(fit.tensor_parallel_size || 1);
+                    const tensorSize = this.clusterFitTensorParallelSize(fit);
                     if (this.clusterTensorParallelOptions().includes(tensorSize)) {
                         // The catalogue arrived at this topology using the
                         // same fit planner. Preview that proven topology rather
@@ -3260,11 +3525,62 @@
                 return nodes > 1 ? [1, nodes] : [1];
             },
 
+            // The catalogue fit is the FEWEST-node plan: a model that fits one
+            // Mac reports tensor_parallel_size=1 even when two Macs are wired.
+            // Adopting that 1 into a 2-node plan builder made every preview a
+            // pipeline plan, which 400s for architectures without the MLX-LM
+            // pipeline forward path. Translate the fit into the topology valid
+            // for the nodes actually configured.
+            clusterFitTensorParallelSize(fit) {
+                const nodes = Math.max(1, this.clusterPlanNodes.length);
+                const fitted = Number(fit?.tensor_parallel_size || 1);
+                if (Number(fit?.nodes_required || 1) >= nodes) return fitted;
+                // Force full tensor only when the architecture actually
+                // supports it — both flags can be false (unsplittable), and
+                // tp=nodes there turns the accurate "cannot combine Macs"
+                // refusal into a confusing heads-divisibility error.
+                if (
+                    fit?.supports_pipeline === false
+                    && fit?.supports_tensor_parallel === true
+                ) return nodes;
+                // Pipeline is possible too: keep whatever is selected.
+                return Number(this.clusterPlanTensorParallelSize) || 1;
+            },
+
             normalizeClusterTensorParallelSize() {
                 const options = this.clusterTensorParallelOptions();
                 const current = Number(this.clusterPlanTensorParallelSize);
+                // Snap an out-of-range value to the largest available degree
+                // (tensor parallelism) rather than 1 (pipeline) — several
+                // architectures (VLMs) support tensor but not the MLX-LM
+                // pipeline forward path, so 1 would make the only valid plan
+                // fail. This must also fire when the cluster genuinely shrank
+                // to one node (options === [1]); leaving a stale multi-way
+                // size there sends /plan a world size that cannot divide. The
+                // transient-poll wipe this used to cause is prevented
+                // upstream: the poll skips resync mid-activation and only
+                // rebuilds the node set when it actually changed.
                 if (!options.includes(current)) {
-                    this.clusterPlanTensorParallelSize = 1;
+                    this.clusterPlanTensorParallelSize =
+                        options[options.length - 1];
+                    this.invalidateClusterPlan();
+                }
+                // tp=1 on a multi-node cluster means pipeline. For a model whose
+                // architecture cannot pipeline the only valid multi-node plan is
+                // full tensor; leaving 1 here guarantees a 400 from /plan on
+                // every preview.
+                const fit = this.clusterCatalogueFit(
+                    this.clusterPlanModelPath.trim()
+                );
+                if (
+                    options.length > 1
+                    && Number(this.clusterPlanTensorParallelSize) === 1
+                    && fit?.fits === true
+                    && fit.supports_pipeline === false
+                    && fit.supports_tensor_parallel === true
+                ) {
+                    this.clusterPlanTensorParallelSize =
+                        options[options.length - 1];
                     this.invalidateClusterPlan();
                 }
             },
@@ -3362,13 +3678,52 @@
                 if (this.clusterPeerProbeLoading
                     || this.clusterFabricLoading
                     || this.clusterLinkStatusLoading
-                    || !this.clusterPeerProbe?.runtime_compatible) {
+                    || !this.clusterPeerProbe) {
                     return {
                         key: 'checking',
                         label: 'Checking the connection…',
                         detail: 'oMLX is confirming every worker and the fastest shared links.',
                         tone: 'blue',
                         busy: true,
+                    };
+                }
+                // Strictly false, not merely not-true: a payload that predates
+                // the runtime fields carries no verdict, and rendering it red
+                // would invent a measurement nobody took.
+                if (this.clusterPeerProbe.runtime_compatible === false) {
+                    const mismatches = Array.isArray(
+                        this.clusterPeerProbe.runtime_mismatches
+                    ) ? this.clusterPeerProbe.runtime_mismatches.filter(Boolean) : [];
+                    // bootstrap_required means oMLX is absent or unverifiable on
+                    // that Mac, not that two runtimes disagree. The two need
+                    // different actions, so they must not share a headline.
+                    if (this.clusterPeerProbe.bootstrap_required) {
+                        return {
+                            key: 'bootstrap',
+                            label: 'Worker runtime setup needed',
+                            detail: this.clusterConnectionError
+                                || mismatches[0]
+                                || 'This worker is reachable, but its oMLX runtime could not be verified.',
+                            tone: 'amber',
+                            busy: false,
+                        };
+                    }
+                    return {
+                        key: 'runtime-mismatch',
+                        label: 'Worker runtime mismatch',
+                        detail: mismatches.join(' · ')
+                            || 'The worker runtime differs from this Mac.',
+                        tone: 'red',
+                        busy: false,
+                    };
+                }
+                if (this.clusterPeerProbe.runtime_compatible !== true) {
+                    return {
+                        key: 'runtime-unverified',
+                        label: 'Worker runtime not verified',
+                        detail: 'This worker is reachable, but oMLX could not verify its runtime yet.',
+                        tone: 'amber',
+                        busy: false,
                     };
                 }
                 if (this.clusterCatalogueLoading && !selected) {
@@ -3532,6 +3887,15 @@
                     return;
                 }
                 await this.startCluster();
+            },
+
+            clusterNodeId(...candidates) {
+                const pattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+                for (const candidate of candidates) {
+                    const value = String(candidate || '').trim();
+                    if (pattern.test(value)) return value;
+                }
+                return '';
             },
 
             clusterFriendlyMacName(name, fallback = 'Mac') {
@@ -3887,10 +4251,35 @@
                 const candidates = this.clusterLogicalNodes().filter(node => (
                     node.memberCount === 2
                     && node.accelerator === 'cuda'
-                    && !node.fabricVerified
                 ));
                 for (const node of candidates) {
                     if (!await this.verifyCudaSupernode(node)) return false;
+                }
+                return true;
+            },
+
+            async prepareCudaSupernodesForActivation({ rebuildPlan = false } = {}) {
+                const planRevision = Number(this._clusterPlanRevision || 0);
+                if (
+                    typeof this.ensureCudaSupernodesVerified === 'function'
+                    && !await this.ensureCudaSupernodesVerified()
+                ) {
+                    const message = this.clusterCudaFabricVerificationError
+                        || 'Verify the CUDA direct link before starting the cluster.';
+                    if (rebuildPlan) this.clusterPlanError = message;
+                    else this.clusterAutoconfigureError = message;
+                    return false;
+                }
+                if (
+                    rebuildPlan
+                    && Number(this._clusterPlanRevision || 0) !== planRevision
+                ) {
+                    await this.runClusterPlan();
+                    if (!this.clusterActivationReady()) {
+                        this.clusterPlanError = this.clusterPlanError
+                            || 'Rebuild the plan after verifying the CUDA direct link.';
+                        return false;
+                    }
                 }
                 return true;
             },
@@ -4661,9 +5050,7 @@
                     const selected = this.clusterSelectedModel();
                     if (selected) {
                         const fit = this.clusterCatalogueFit(selected.model_path);
-                        const tensorSize = Number(
-                            fit?.tensor_parallel_size || 1
-                        );
+                        const tensorSize = this.clusterFitTensorParallelSize(fit);
                         if (
                             fit?.fits === true
                             && this.clusterTensorParallelOptions().includes(tensorSize)
@@ -5018,15 +5405,7 @@
                         'Choose a worker before starting the cluster.';
                     return;
                 }
-                if (
-                    typeof this.ensureCudaSupernodesVerified === 'function'
-                    && !await this.ensureCudaSupernodesVerified()
-                ) {
-                    this.clusterAutoconfigureError =
-                        this.clusterCudaFabricVerificationError
-                        || 'Verify the CUDA direct link before starting the cluster.';
-                    return;
-                }
+                if (!await this.prepareCudaSupernodesForActivation()) return;
                 const linkStatus = await this.loadClusterLinkStatus();
                 if (linkStatus?.setup_available) {
                     const ready = await this.prepareClusterLink();
@@ -5166,7 +5545,10 @@
                     || this.clusterStatus.node.recommended_working_set_bytes
                     || 0
                 );
-                this.clusterPlanNodes[index].node_id = this.clusterStatus.node.hostname;
+                this.clusterPlanNodes[index].node_id = this.clusterNodeId(
+                    this.clusterStatus.node.hostname,
+                    'this-mac',
+                );
                 this.clusterPlanNodes[index].capacity_gib = Number(
                     (exactCapacity / gib).toFixed(2)
                 );
@@ -5443,10 +5825,23 @@
                                 0,
                                 capacityGiB - Math.min(capacityGiB, manualAllowedGiB)
                             );
-                        changed = changed
-                            || node.capacity_gib !== capacityGiB
-                            || node.reserve_gib !== reserveGiB
-                            || node.automatic_reserve_gib !== automaticReserveGiB;
+                        // The admission ceiling is derived from live memory
+                        // pressure and wobbles by a few hundred MiB between
+                        // polls. Re-planning the whole catalogue for that wobble
+                        // emptied the model list and reset the topology controls
+                        // every ten seconds. Only a drift that could change a
+                        // plan invalidates anything.
+                        const drift = (a, b) =>
+                            Math.abs(Number(a || 0) - b) > 0.5;
+                        if (
+                            !drift(node.capacity_gib, capacityGiB)
+                            && !drift(node.reserve_gib, reserveGiB)
+                            && !drift(node.automatic_reserve_gib, automaticReserveGiB)
+                        ) {
+                            node.measured = measured.summary;
+                            return;
+                        }
+                        changed = true;
                         node.capacity_gib = capacityGiB;
                         node.reserve_gib = reserveGiB;
                         node.automatic_reserve_gib = automaticReserveGiB;
@@ -5460,6 +5855,15 @@
                         this.clusterCatalogue = null;
                         this.invalidateClusterPlan();
                     }
+                    // Budgets are now known for this topology. The recurring
+                    // discovery poll must not re-measure them: the peer's live
+                    // admission ceiling wobbles by more than the drift guard on
+                    // a busy Mac, and re-measuring every 10 s emptied the model
+                    // list and reset the topology controls (visible jitter).
+                    // A peer or node change resets this flag (see
+                    // invalidateClusterPeer / the join-status merge); an
+                    // explicit peer selection re-measures directly.
+                    this._clusterBudgetsMeasured = true;
                 } catch (error) {
                     this.clusterBudgetsError = String(error);
                 } finally {
@@ -5894,6 +6298,9 @@
 
             async activateClusterDeployment() {
                 if (!this.clusterActivationReady()) return;
+                if (!await this.prepareCudaSupernodesForActivation({
+                    rebuildPlan: true,
+                })) return;
                 this.clusterActivationLoading = true;
                 this.clusterActivationResult = null;
                 this.clusterPlanChanges = null;
@@ -6260,12 +6667,16 @@
                 const s = this.globalSettings;
                 if (!s.server.host) errors.push('Host');
                 if (!s.server.port) errors.push('Port');
+                if (!s.server.max_audio_upload_size) errors.push('Maximum Audio Upload Size');
                 if (!s.model.model_dirs || !s.model.model_dirs.some(d => d.trim())) errors.push('Model Directory');
                 if (!s.scheduler.max_concurrent_requests) errors.push('Max Concurrent Requests');
                 if (!s.scheduler.embedding_batch_size) errors.push('Embedding Batch Size');
                 if (!s.cache.ssd_cache_max_size) errors.push('Max Cache Size');
                 if (!s.sampling.max_context_window) errors.push('Max Context Window');
                 if (!s.sampling.max_tokens) errors.push('Max Tokens');
+                if (s.cache.gdn_snapshot_storage === 'ssd_sidecar' && s.cache.hot_cache_only) {
+                    errors.push('GDN SSD sidecar requires Hot Cache Only to be disabled');
+                }
 
                 if (errors.length > 0) {
                     this.saveError = window.t('js.error.required_fields').replace('{fields}', errors.join(', '));
@@ -6299,6 +6710,7 @@
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
                             distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
+                            max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             model_fallback: this.globalSettings.model.model_fallback,
                             hide_helper_models: this.globalSettings.model.hide_helper_models,
@@ -6318,6 +6730,11 @@
                             ),
                             initial_cache_blocks: this.globalSettings.cache.initial_cache_blocks,
                             hot_cache_only: this.globalSettings.cache.hot_cache_only,
+                            hot_cache_write_through: this.globalSettings.cache.hot_cache_write_through,
+                            ane_compile_cache: this.globalSettings.cache.ane_compile_cache,
+                            gdn_snapshot_storage: this.globalSettings.cache.gdn_snapshot_storage,
+                            gdn_ssd_pending_max_size: this.globalSettings.cache.gdn_ssd_pending_max_size,
+                            gdn_sidecar_precision: this.globalSettings.cache.gdn_sidecar_precision,
                             sampling_max_context_window: this.globalSettings.sampling.max_context_window,
                             sampling_max_context_window_policy: this.globalSettings.sampling.max_context_window_policy || null,
                             sampling_max_tokens: this.globalSettings.sampling.max_tokens,
@@ -6326,6 +6743,7 @@
                             sampling_top_k: this.globalSettings.sampling.top_k,
                             sampling_repetition_penalty: this.globalSettings.sampling.repetition_penalty,
                             mcp_config: this.globalSettings.mcp.config_path,
+                            mcp_expose_tools: this.globalSettings.mcp.expose_tools,
                             hf_cache_enabled: this.globalSettings.huggingface.hf_cache_enabled,
                             network_http_proxy: this.globalSettings.network.http_proxy,
                             network_https_proxy: this.globalSettings.network.https_proxy,
@@ -6470,8 +6888,15 @@
                     });
 
                     if (response.ok) {
-                        if (field === 'is_default' && value === true) {
-                            this.models.forEach(m => { m.is_default = (m.id === modelId); });
+                        if (field === 'is_default') {
+                            if (value === true) {
+                                // Exactly this model is default now; every other
+                                // model's flag clears.
+                                this.models.forEach(m => { m.is_default = (m.id === modelId); });
+                            } else {
+                                const model = this.models.find(m => m.id === modelId);
+                                if (model) model.is_default = false;
+                            }
                         } else if (field === 'is_pinned') {
                             const model = this.models.find(m => m.id === modelId);
                             if (model) model.pinned = value;
@@ -6525,8 +6950,9 @@
                         method: 'POST',
                     });
                     if (response.ok) {
+                        const data = await response.json();
                         const model = this.models.find(m => m.id === modelId);
-                        if (model) model.loaded = false;
+                        if (model && data.status === 'ok') model.loaded = false;
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
@@ -6598,17 +7024,17 @@
                         if (e.force) forced.push('enable_thinking');
                     } else if (e.type === 'reasoning_effort') {
                         if (isDiffusion) continue;
-                        ctk.reasoning_effort = e.value;
-                        if (e.force) forced.push('reasoning_effort');
+                        const rawEffort = e.custom ? e.customValue : e.value;
+                        const effort = this.coerceKwargValue(rawEffort);
+                        if (String(effort).trim() !== '') {
+                            ctk.reasoning_effort = effort;
+                            if (e.force) forced.push('reasoning_effort');
+                        }
                     } else if (e.type === 'custom' && e.key && e.key.trim()) {
                         if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(e.key.trim())) {
                             continue;
                         }
-                        let v = e.value;
-                        if (v === 'true') v = true;
-                        else if (v === 'false') v = false;
-                        else if (!isNaN(Number(v)) && String(v).trim() !== '') v = Number(v);
-                        ctk[e.key.trim()] = v;
+                        ctk[e.key.trim()] = this.coerceKwargValue(e.value);
                         if (e.force) forced.push(e.key.trim());
                     }
                 }
@@ -6783,6 +7209,13 @@
                 return DIFFUSION_CONFIG_MODEL_TYPES.has(modelType);
             },
 
+            isQwen35AnePrefillModel(model) {
+                const modelType = String(model?.config_model_type || '')
+                    .toLowerCase()
+                    .replace(/-/g, '_');
+                return QWEN35_ANE_CONFIG_PREFIXES.some(prefix => modelType.startsWith(prefix));
+            },
+
             isDiffusionUnsupportedProfileField(field) {
                 return DIFFUSION_UNSUPPORTED_PROFILE_FIELDS.has(field);
             },
@@ -6812,7 +7245,9 @@
                 if (DFLASH_DRAFTER_CONFIG_MODEL_TYPES.has(configType)) {
                     return true;
                 }
-                return /(^|[-_/\s])dflash($|[-_/\s])/i.test(this.draftModelSearchText(model));
+                // DFlash 2 checkpoints are versioned ("-DFlash2"), so allow an
+                // optional numeric suffix after the "dflash" token.
+                return /(^|[-_/\s])dflash[0-9]*($|[-_/\s])/i.test(this.draftModelSearchText(model));
             },
 
             isVlmMtpDraftModel(model) {
@@ -6868,6 +7303,18 @@
                     || !!ms.guided_grammar_enabled;
             },
 
+            // Coerce a raw kwarg string from the panel into its JSON type:
+            // 'true'/'false' -> boolean, finite numeric strings -> number.
+            coerceKwargValue(v) {
+                if (v === 'true') return true;
+                if (v === 'false') return false;
+                if (String(v).trim() !== '') {
+                    const numeric = Number(v);
+                    if (Number.isFinite(numeric)) return numeric;
+                }
+                return v;
+            },
+
             buildCtKwargEntries(chatTemplateKwargs, forcedCtKwargs, isDiffusion = false) {
                 const ctk = chatTemplateKwargs || {};
                 const forced = new Set(forcedCtKwargs || []);
@@ -6883,9 +7330,13 @@
                             force: forced.has('enable_thinking'),
                         });
                     } else if (key === 'reasoning_effort') {
+                        const isPreset = typeof value === 'string'
+                            && REASONING_EFFORT_PRESETS.has(value);
                         entries.push({
                             type: 'reasoning_effort',
-                            value: String(value),
+                            value: isPreset ? value : 'low',
+                            custom: !isPreset,
+                            customValue: isPreset ? '' : String(value),
                             force: forced.has('reasoning_effort'),
                         });
                     } else {
@@ -6923,6 +7374,12 @@
                     force_sampling: s.force_sampling || false,
                     enable_thinking: s.enable_thinking ?? null,
                     thinking_default: model?.thinking_default ?? null,
+                    qwen4_ple_ssd_offload: model?.qwen4_ple_ssd_offload_forced === true
+                        || s.qwen4_ple_ssd_offload === true,
+                    qwen4_ple_ssd_offload_supported:
+                        model?.qwen4_ple_ssd_offload_supported === true,
+                    qwen4_ple_ssd_offload_forced:
+                        model?.qwen4_ple_ssd_offload_forced === true,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
@@ -6935,6 +7392,22 @@
                     index_cache_freq: s.index_cache_freq || null,
                     turboquant_kv_enabled: s.turboquant_kv_enabled || false,
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
+                    qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
+                    qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
+                    qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
+                    qwen35_ane_prefill_fraction: s.qwen35_ane_prefill_fraction ?? 0.53,
+                    qwen35_ane_prefill_fused_down: s.qwen35_ane_prefill_fused_down || false,
+                    qwen35_ane_prefill_max_layers: s.qwen35_ane_prefill_max_layers || 64,
+                    qwen35_ane_prefill_dual_ane: s.qwen35_ane_prefill_dual_ane !== false,
+                    qwen35_ane_prefill_gdn: s.qwen35_ane_prefill_gdn !== false,
+                    qwen35_ane_prefill_gdn_fraction: s.qwen35_ane_prefill_gdn_fraction ?? 0.5,
+                    qwen35_ane_prefill_gdn_max_layers: s.qwen35_ane_prefill_gdn_max_layers ?? 48,
+                    qwen35_ane_prefill_cpu_enabled: s.qwen35_ane_prefill_cpu_enabled || false,
+                    qwen35_ane_prefill_cpu_fraction: s.qwen35_ane_prefill_cpu_fraction ?? 0.135,
+                    qwen35_ane_prefill_cpu_down_fraction: s.qwen35_ane_prefill_cpu_down_fraction ?? 0,
+                    qwen35_ane_prefill_cpu_gdn_fraction: s.qwen35_ane_prefill_cpu_gdn_fraction ?? 0,
+                    qwen35_ane_prefill_cpu_threads: s.qwen35_ane_prefill_cpu_threads ?? 8,
+                    qwen35_ane_prefill_cpu_shared_resource: s.qwen35_ane_prefill_cpu_shared_resource !== false,
                     specprefill_enabled: s.specprefill_enabled || false,
                     specprefill_draft_model: s.specprefill_draft_model || '',
                     specprefill_keep_pct: s.specprefill_keep_pct ? String(s.specprefill_keep_pct) : '0.2',
@@ -6956,7 +7429,8 @@
                         ? Math.round(s.dflash_ssd_cache_max_bytes / (1024 ** 3))
                         : 20,
                     dflash_draft_window_size: s.dflash_draft_window_size ?? null,
-                    dflash_draft_sink_size: s.dflash_draft_sink_size ?? null,
+                    dflash_draft_sink_size: s.dflash_draft_sink_size ?? 0,
+                    dflash_block_size: s.dflash_block_size ?? null,
                     dflash_verify_mode: s.dflash_verify_mode || 'adaptive',
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
@@ -7106,6 +7580,7 @@
             },
             async applyProfileToForm(profile) {
                 const seq = ++this._applySeq;
+                this.profileError = '';
                 try {
                     const r = await fetch(
                         `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/profiles/${encodeURIComponent(profile.name)}/apply`,
@@ -7133,8 +7608,12 @@
                         if (m) m.settings = { ...settings };
                     } else if (r.status === 401) {
                         window.location.href = '/admin';
+                    } else {
+                        const data = await r.json().catch(() => ({}));
+                        this.profileError = data.detail || 'Failed to apply profile';
                     }
                 } catch (e) {
+                    this.profileError = String(e);
                     console.error('Failed to apply profile:', e);
                 }
             },
@@ -7334,6 +7813,283 @@
                 }
             },
 
+            aneTuningForSelectedModel() {
+                return !!this.selectedModel
+                    && this.aneTuning.modelId === this.selectedModel.id;
+            },
+
+            aneTuningProgressPercent() {
+                const current = Number(this.aneTuning.status?.current || 0);
+                const total = Number(
+                    this.aneTuning.status?.total || this.aneTuning.total || 0
+                );
+                if (total <= 0) return 0;
+                return Math.max(0, Math.min(100, current / total * 100));
+            },
+
+            aneTuningRecommendationText() {
+                const recommendation = this.aneTuning.status?.recommendation;
+                if (!recommendation) return '';
+                const measured = recommendation.processing_tps !== null
+                    && recommendation.processing_tps !== undefined;
+                const speed = Number(recommendation.processing_tps || 0).toFixed(1);
+                const speedup = Number(recommendation.speedup_percent || 0);
+                const speedupText = `${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%`;
+                const speedSuffix = measured
+                    ? ` · ${speed} prompt tok/s · ${speedupText}`
+                    : '';
+                if (!recommendation.enabled) {
+                    return `GPU only${speedSuffix}`;
+                }
+                const parts = [
+                    `${recommendation.fused_down ? 'Fused MLP per ANE' : 'MLP'} ${Math.round(Number(recommendation.mlp_fraction) * 100)}%`,
+                ];
+                if (recommendation.gdn_enabled) {
+                    parts.push(
+                        `GDN ${Math.round(Number(recommendation.gdn_fraction) * 100)}%`
+                    );
+                } else {
+                    parts.push('GDN off');
+                }
+                if (recommendation.cpu_enabled) {
+                    parts.push(
+                        `CPU gate ${Math.round(Number(recommendation.cpu_fraction || 0) * 100)}%`,
+                        `CPU down ${Math.round(Number(recommendation.cpu_down_fraction || 0) * 100)}%`,
+                        `CPU GDN ${Math.round(Number(recommendation.cpu_gdn_fraction || 0) * 100)}%`,
+                    );
+                }
+                if (Number(recommendation.tail_padding_min_tokens || 0) > 0) {
+                    parts.push(
+                        `Pad tails ≥${Number(recommendation.tail_padding_min_tokens)}`
+                    );
+                }
+                return `${parts.join(' · ')}${speedSuffix}`;
+            },
+
+            aneTuningResultText(result) {
+                if (result?.processing_tps === null
+                    || result?.processing_tps === undefined) {
+                    if (result?.latency_ms !== null
+                        && result?.latency_ms !== undefined) {
+                        return `${Number(result.latency_ms).toFixed(2)} ms`;
+                    }
+                    // Keep unfinished rows visible but leave their result cell
+                    // blank, including the candidate that stopped the run.
+                    return '';
+                }
+                const speed = Number(result.processing_tps).toFixed(1);
+                if (result.speedup_percent === null
+                    || result.speedup_percent === undefined) {
+                    return speed;
+                }
+                const speedup = Number(result.speedup_percent);
+                return `${speed} (${speedup >= 0 ? '+' : ''}${speedup.toFixed(1)}%)`;
+            },
+
+            _scheduleANETuningPoll() {
+                if (this._aneTuningPollTimer) {
+                    clearTimeout(this._aneTuningPollTimer);
+                }
+                if (!this.aneTuning.running) return;
+                this._aneTuningPollTimer = setTimeout(
+                    () => this.pollANETuning(),
+                    1000,
+                );
+            },
+
+            async startANETuning() {
+                if (!this.selectedModel || this.aneTuning.running) return;
+                const modelId = this.selectedModel.id;
+                if (this._aneTuningPollTimer) {
+                    clearTimeout(this._aneTuningPollTimer);
+                    this._aneTuningPollTimer = null;
+                }
+                this.aneTuning = {
+                    tuningId: null,
+                    modelId,
+                    running: true,
+                    cancelling: false,
+                    applying: false,
+                    applied: false,
+                    total: 0,
+                    status: null,
+                    error: '',
+                };
+                try {
+                    const response = await fetch('/admin/api/bench/ane-tune/start', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            model_id: modelId,
+                            sequence_length: parseInt(
+                                this.modelSettings.qwen35_ane_prefill_sequence_length
+                            ) || 2048,
+                            repeats: 2,
+                            allow_cpu: this.aneTuningOverrides.allowCpu,
+                            allow_cpu_gate: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowCpuGate,
+                            allow_cpu_down: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowCpuDown,
+                            allow_ane_gdn: this.aneTuningOverrides.allowAneGdn,
+                            allow_cpu_gdn: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowAneGdn
+                                && this.aneTuningOverrides.allowCpuGdn,
+                            allow_cpu_shared_resource: this.aneTuningOverrides.allowCpu
+                                && this.aneTuningOverrides.allowCpuSharedResource,
+                        }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(data.detail || 'Failed to start ANE tuning.');
+                    }
+                    this.aneTuning.tuningId = data.tuning_id;
+                    this.aneTuning.total = Number(data.total || 0);
+                    await this.pollANETuning();
+                } catch (error) {
+                    this.aneTuning.running = false;
+                    this.aneTuning.error = error.message || String(error);
+                }
+            },
+
+            async pollANETuning() {
+                const tuningId = this.aneTuning.tuningId;
+                if (!tuningId || !this.aneTuning.running) return;
+                try {
+                    const response = await fetch(
+                        `/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/results`
+                    );
+                    const data = await response.json().catch(() => ({}));
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(data.detail || 'Failed to read ANE tuning progress.');
+                    }
+                    if (this.aneTuning.tuningId !== tuningId) return;
+                    if (!data.termination_reason && data.status === 'error') {
+                        data.termination_reason = data.error || data.message || 'ANE tuning failed.';
+                    }
+                    this.aneTuning.status = data;
+                    this.aneTuning.total = Number(data.total || this.aneTuning.total || 0);
+                    this.aneTuning.running = data.status === 'running';
+                    this.aneTuning.cancelling = false;
+                    if (data.status === 'error' || data.status === 'cancelled') {
+                        // Early termination belongs beside the partial result
+                        // matrix. Keep this field for request/transport errors.
+                        this.aneTuning.error = '';
+                    }
+                    this._scheduleANETuningPoll();
+                } catch (error) {
+                    this.aneTuning.running = false;
+                    this.aneTuning.cancelling = false;
+                    this.aneTuning.error = error.message || String(error);
+                }
+            },
+
+            async cancelANETuning() {
+                const tuningId = this.aneTuning.tuningId;
+                if (!tuningId || !this.aneTuning.running || this.aneTuning.cancelling) return;
+                this.aneTuning.cancelling = true;
+                try {
+                    const response = await fetch(
+                        `/admin/api/bench/ane-tune/${encodeURIComponent(tuningId)}/cancel`,
+                        { method: 'POST' },
+                    );
+                    const data = await response.json().catch(() => ({}));
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(data.detail || 'Failed to cancel ANE tuning.');
+                    }
+                    await this.pollANETuning();
+                } catch (error) {
+                    this.aneTuning.cancelling = false;
+                    this.aneTuning.error = error.message || String(error);
+                }
+            },
+
+            async applyANETuningRecommendation() {
+                if (!this.selectedModel || !this.aneTuningForSelectedModel()) return;
+                const recommendation = this.aneTuning.status?.recommendation;
+                if (!recommendation || this.aneTuning.applying) return;
+                const patch = {
+                    qwen35_ane_prefill_enabled: !!recommendation.enabled,
+                    qwen35_ane_prefill_sequence_length: Number(recommendation.sequence_length),
+                    qwen35_ane_prefill_tail_padding_min_tokens: Number(
+                        recommendation.tail_padding_min_tokens || 0
+                    ),
+                };
+                if (recommendation.enabled) {
+                    patch.qwen35_ane_prefill_fraction = Number(recommendation.mlp_fraction);
+                    patch.qwen35_ane_prefill_fused_down = !!recommendation.fused_down;
+                    patch.qwen35_ane_prefill_gdn = !!recommendation.gdn_enabled;
+                    if (recommendation.gdn_enabled) {
+                        patch.qwen35_ane_prefill_gdn_fraction = Number(
+                            recommendation.gdn_fraction
+                        );
+                    }
+                    patch.qwen35_ane_prefill_cpu_enabled = !!recommendation.cpu_enabled;
+                    patch.qwen35_ane_prefill_cpu_fraction = Number(
+                        recommendation.cpu_fraction || 0
+                    );
+                    patch.qwen35_ane_prefill_cpu_down_fraction = Number(
+                        recommendation.cpu_down_fraction || 0
+                    );
+                    patch.qwen35_ane_prefill_cpu_gdn_fraction = Number(
+                        recommendation.cpu_gdn_fraction || 0
+                    );
+                    if (recommendation.cpu_threads !== null
+                        && recommendation.cpu_threads !== undefined) {
+                        patch.qwen35_ane_prefill_cpu_threads = Number(
+                            recommendation.cpu_threads
+                        );
+                    }
+                    if (recommendation.cpu_shared_resource !== null
+                        && recommendation.cpu_shared_resource !== undefined) {
+                        patch.qwen35_ane_prefill_cpu_shared_resource =
+                            !!recommendation.cpu_shared_resource;
+                    }
+                }
+
+                this.aneTuning.applying = true;
+                this.aneTuning.error = '';
+                try {
+                    const response = await fetch(
+                        `/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`,
+                        {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(patch),
+                        },
+                    );
+                    const data = await response.json().catch(() => ({}));
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    if (!response.ok) {
+                        throw new Error(data.detail || 'Failed to apply ANE tuning result.');
+                    }
+                    Object.assign(this.modelSettings, patch);
+                    const model = this.models.find(item => item.id === this.selectedModel.id);
+                    if (model && data.settings) {
+                        model.settings = { ...data.settings };
+                    }
+                    this.aneTuning.applied = true;
+                } catch (error) {
+                    this.aneTuning.error = error.message || String(error);
+                } finally {
+                    this.aneTuning.applying = false;
+                }
+            },
+
             async openModelSettings(model) {
                 this.profileError = '';
                 this.showNewProfileForm = false;
@@ -7406,8 +8162,90 @@
                 }
             },
 
+            validateQwenAneSettings() {
+                if (!this.modelSettings.qwen35_ane_prefill_enabled) return null;
+
+                const integer = (value, label, minimum) => {
+                    if (value === '' || value === null || value === undefined) {
+                        return `${label} is required.`;
+                    }
+                    const number = Number(value);
+                    if (!Number.isInteger(number)) return `${label} must be an integer.`;
+                    if (number < minimum) return `${label} must be at least ${minimum}.`;
+                    return null;
+                };
+                const fraction = (value, label, minimum, maximum) => {
+                    if (value === '' || value === null || value === undefined) {
+                        return `${label} is required.`;
+                    }
+                    const number = Number(value);
+                    if (!Number.isFinite(number)) return `${label} must be a number.`;
+                    if (number < minimum || number > maximum) {
+                        return `${label} must be between ${minimum} and ${maximum}.`;
+                    }
+                    return null;
+                };
+
+                const sequenceLength = Number(this.modelSettings.qwen35_ane_prefill_sequence_length);
+                let error = integer(sequenceLength, 'ANE prompt block', 1024);
+                if (!error && sequenceLength % 64 !== 0) {
+                    error = 'ANE prompt block must be a multiple of 64.';
+                }
+                if (error) return error;
+                error = integer(
+                    this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens,
+                    'ANE tail padding threshold',
+                    0,
+                );
+                if (error) return error;
+                if (Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens) >= sequenceLength) {
+                    return 'ANE tail padding threshold must be less than the prompt block.';
+                }
+                error = fraction(this.modelSettings.qwen35_ane_prefill_fraction, 'MLP ANE fraction', 0.05, 0.90);
+                if (error) return error;
+                error = integer(this.modelSettings.qwen35_ane_prefill_max_layers, 'ANE MLP layer limit', 1);
+                if (error) return error;
+
+                if (this.modelSettings.qwen35_ane_prefill_cpu_enabled) {
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_fraction, 'CPU MLP fraction', 0, 0.25);
+                    if (error) return error;
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction, 'CPU MLP down fraction', 0, 0.50);
+                    if (error) return error;
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction, 'CPU GDN fraction', 0, 0.50);
+                    if (error) return error;
+                    error = integer(this.modelSettings.qwen35_ane_prefill_cpu_threads, 'CPU worker count', 0);
+                    if (error) return error;
+                    if (Number(this.modelSettings.qwen35_ane_prefill_cpu_threads) > 64) {
+                        return 'CPU worker count must be between 0 and 64.';
+                    }
+                    if (Number(this.modelSettings.qwen35_ane_prefill_fraction)
+                        + Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction) >= 1) {
+                        return 'MLP ANE and CPU fractions must total less than 1.0.';
+                    }
+                }
+
+                if (this.modelSettings.qwen35_ane_prefill_gdn) {
+                    error = fraction(this.modelSettings.qwen35_ane_prefill_gdn_fraction, 'GDN ANE fraction', 0.05, 0.90);
+                    if (error) return error;
+                    if (this.modelSettings.qwen35_ane_prefill_cpu_enabled
+                        && Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction)
+                        + Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction) >= 1) {
+                        return 'GDN ANE and CPU fractions must total less than 1.0.';
+                    }
+                    error = integer(this.modelSettings.qwen35_ane_prefill_gdn_max_layers, 'ANE GDN layer limit', 0);
+                    if (error) return error;
+                }
+                return null;
+            },
+
             async saveModelSettings() {
                 if (!this.selectedModel) return;
+
+                const qwenAneValidationError = this.validateQwenAneSettings();
+                if (qwenAneValidationError) {
+                    alert(qwenAneValidationError);
+                    return;
+                }
 
                 this.savingModelSettings = true;
                 try {
@@ -7426,13 +8264,16 @@
                                     if (entry.force) forcedCtKwargs.push('enable_thinking');
                                 } else if (entry.type === 'reasoning_effort') {
                                     if (isDiffusion) continue;
-                                    chatTemplateKwargs.reasoning_effort = entry.value;
-                                    if (entry.force) forcedCtKwargs.push('reasoning_effort');
+                                    const rawEffort = entry.custom
+                                        ? entry.customValue
+                                        : entry.value;
+                                    const effort = this.coerceKwargValue(rawEffort);
+                                    if (String(effort).trim() !== '') {
+                                        chatTemplateKwargs.reasoning_effort = effort;
+                                        if (entry.force) forcedCtKwargs.push('reasoning_effort');
+                                    }
                                 } else if (entry.type === 'custom' && entry.key && entry.key.trim()) {
-                                    let val = entry.value;
-                                    if (val === 'true') val = true;
-                                    else if (val === 'false') val = false;
-                                    else if (!isNaN(Number(val)) && val.trim() !== '') val = Number(val);
+                                    const val = this.coerceKwargValue(entry.value);
                                     const key = entry.key.trim();
                                     if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(key)) {
                                         continue;
@@ -7459,6 +8300,8 @@
                                     ? (this.modelSettings.index_cache_freq || 4)
                                     : 0,
                                 enable_thinking: this.modelSettings.enable_thinking,
+                                qwen4_ple_ssd_offload:
+                                    !!this.modelSettings.qwen4_ple_ssd_offload,
                                 thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
                                 thinking_budget_tokens: this.modelSettings.enableThinkingBudget
                                     ? (this.modelSettings.thinking_budget_tokens || null)
@@ -7478,6 +8321,34 @@
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
+                                qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
+                                // Validation only runs when the feature is enabled, so a
+                                // blank numeric input must fall back to the server default
+                                // instead of coercing to 0 and failing an unrelated save.
+                                qwen35_ane_prefill_sequence_length: Number(this.modelSettings.qwen35_ane_prefill_sequence_length) || 2048,
+                                qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens)
+                                    : 0,
+                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction) || 0.53,
+                                qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
+                                qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
+                                qwen35_ane_prefill_gdn: !!this.modelSettings.qwen35_ane_prefill_gdn,
+                                qwen35_ane_prefill_gdn_fraction: Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction) || 0.5,
+                                qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers)
+                                    : 48,
+                                qwen35_ane_prefill_cpu_enabled: !!this.modelSettings.qwen35_ane_prefill_cpu_enabled,
+                                qwen35_ane_prefill_cpu_fraction: Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction),
+                                qwen35_ane_prefill_cpu_down_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction)
+                                    : 0,
+                                qwen35_ane_prefill_cpu_gdn_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction)
+                                    : 0,
+                                qwen35_ane_prefill_cpu_threads: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_threads))
+                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_threads)
+                                    : 8,
+                                qwen35_ane_prefill_cpu_shared_resource: !!this.modelSettings.qwen35_ane_prefill_cpu_shared_resource,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
                                 specprefill_keep_pct: this.modelSettings.specprefill_enabled
@@ -7517,7 +8388,7 @@
                                 dflash_ssd_cache_max_bytes: this.modelSettings.dflash_enabled
                                     ? Math.max(1, parseInt(this.modelSettings.dflash_ssd_cache_max_gib) || 20) * (1024 ** 3)
                                     : 20 * (1024 ** 3),
-                                // Long-context tuning. Null → server keeps it null → dflash-mlx default.
+                                // Long-context tuning. Empty → oMLX default.
                                 dflash_draft_window_size: this.modelSettings.dflash_enabled
                                     && this.modelSettings.dflash_draft_window_size
                                     ? parseInt(this.modelSettings.dflash_draft_window_size)
@@ -7527,6 +8398,10 @@
                                     && this.modelSettings.dflash_draft_sink_size !== undefined
                                     && this.modelSettings.dflash_draft_sink_size !== ''
                                     ? parseInt(this.modelSettings.dflash_draft_sink_size)
+                                    : 0,
+                                dflash_block_size: this.modelSettings.dflash_enabled
+                                    && this.modelSettings.dflash_block_size
+                                    ? parseInt(this.modelSettings.dflash_block_size)
                                     : null,
                                 dflash_verify_mode: this.modelSettings.dflash_enabled
                                     ? (this.modelSettings.dflash_verify_mode || 'adaptive')
@@ -7560,6 +8435,21 @@
                                     max_tool_result_tokens: 0,
                                     turboquant_kv_enabled: false,
                                     turboquant_kv_bits: 4,
+                                    qwen35_ane_prefill_enabled: false,
+                                    qwen35_ane_prefill_sequence_length: 2048,
+                                    qwen35_ane_prefill_tail_padding_min_tokens: 0,
+                                    qwen35_ane_prefill_fraction: 0.53,
+                                    qwen35_ane_prefill_max_layers: 64,
+                                    qwen35_ane_prefill_dual_ane: true,
+                                    qwen35_ane_prefill_gdn: true,
+                                    qwen35_ane_prefill_gdn_fraction: 0.5,
+                                    qwen35_ane_prefill_gdn_max_layers: 48,
+                                    qwen35_ane_prefill_cpu_enabled: false,
+                                    qwen35_ane_prefill_cpu_fraction: 0.135,
+                                    qwen35_ane_prefill_cpu_down_fraction: 0,
+                                    qwen35_ane_prefill_cpu_gdn_fraction: 0,
+                                    qwen35_ane_prefill_cpu_threads: 8,
+                                    qwen35_ane_prefill_cpu_shared_resource: true,
                                     specprefill_enabled: false,
                                     specprefill_draft_model: null,
                                     specprefill_keep_pct: null,
@@ -7578,6 +8468,7 @@
                                     dflash_ssd_cache_max_bytes: 20 * (1024 ** 3),
                                     dflash_draft_window_size: null,
                                     dflash_draft_sink_size: null,
+                                    dflash_block_size: null,
                                     dflash_verify_mode: null,
                                     mtp_enabled: false,
                                     vlm_mtp_enabled: false,
@@ -7648,6 +8539,21 @@
                         this.modelSettings.ctKwargEntries = [];
                         this.modelSettings.turboquant_kv_enabled = false;
                         this.modelSettings.turboquant_kv_bits = 4;
+                        this.modelSettings.qwen35_ane_prefill_enabled = false;
+                        this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;
+                        this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens = 0;
+                        this.modelSettings.qwen35_ane_prefill_fraction = 0.53;
+                        this.modelSettings.qwen35_ane_prefill_max_layers = 64;
+                        this.modelSettings.qwen35_ane_prefill_dual_ane = true;
+                        this.modelSettings.qwen35_ane_prefill_gdn = true;
+                        this.modelSettings.qwen35_ane_prefill_gdn_fraction = 0.5;
+                        this.modelSettings.qwen35_ane_prefill_gdn_max_layers = 48;
+                        this.modelSettings.qwen35_ane_prefill_cpu_enabled = false;
+                        this.modelSettings.qwen35_ane_prefill_cpu_fraction = 0.135;
+                        this.modelSettings.qwen35_ane_prefill_cpu_down_fraction = 0;
+                        this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction = 0;
+                        this.modelSettings.qwen35_ane_prefill_cpu_threads = 8;
+                        this.modelSettings.qwen35_ane_prefill_cpu_shared_resource = true;
                         this.modelSettings.specprefill_enabled = false;
                         this.modelSettings.specprefill_draft_model = null;
                         this.modelSettings.specprefill_keep_pct = 0.2;
@@ -7665,7 +8571,8 @@
                         this.modelSettings.dflash_ssd_cache = false;
                         this.modelSettings.dflash_ssd_cache_max_gib = 20;
                         this.modelSettings.dflash_draft_window_size = null;
-                        this.modelSettings.dflash_draft_sink_size = null;
+                        this.modelSettings.dflash_draft_sink_size = 0;
+                        this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
                         this.modelSettings.trust_remote_code = false;
@@ -8017,6 +8924,7 @@
                             brave_api_key: this.globalSettings.integrations.web_search_brave_api_key || '',
                             searxng_url: this.globalSettings.integrations.web_search_searxng_url || '',
                             ddgs_backends: this.globalSettings.integrations.web_search_ddgs_backends || '',
+                            max_results: this.globalSettings.integrations.web_search_max_results,
                         }),
                     });
                     const payload = await response.json();
@@ -8428,10 +9336,28 @@
                 return value;
             },
 
+            saveAccExternalMaxTokens() {
+                localStorage.setItem('omlx_acc_external_max_tokens', this.accExternalMaxTokens.trim());
+            },
+
+            // Optional accuracy-only floor for per-question max_tokens.
+            // Returns null when unset; throws on invalid input.
+            parseAccuracyMaxTokens() {
+                const raw = this.accExternalMaxTokens.trim();
+                if (!raw) return null;
+                const value = Number(raw);
+                if (!Number.isInteger(value) || value < 1 || value > 1000000) {
+                    throw new Error(window.t('js.error.external_max_tokens_invalid'));
+                }
+                return value;
+            },
+
             accuracyExternalRequestBody() {
                 const body = this.externalRequestBody();
                 const extraBody = this.parseAccuracyExtraBody();
                 if (Object.keys(extraBody).length > 0) body.extra_body = extraBody;
+                const maxTokens = this.parseAccuracyMaxTokens();
+                if (maxTokens !== null) body.max_tokens_override = maxTokens;
                 return body;
             },
 
@@ -8489,6 +9415,7 @@
                         body: JSON.stringify({
                             model_id: this.benchExternalEnabled ? this.externalModel.trim() : this.benchModelId,
                             context_profile: this.benchContextProfile,
+                            align_prompt_to_ane: this.benchAlignPromptToAne,
                             prompt_lengths: promptLengths,
                             generation_length: 128,
                             batch_sizes: batchSizes,
@@ -9260,6 +10187,22 @@
                                     if (!exists) {
                                         data.data._showCategories = false;
                                         this.accAllResults.push(data.data);
+                                    }
+                                }
+                                break;
+                            case 'upload':
+                                // Community upload outcome for one suite. Idempotent
+                                // on replay: keyed to the same (model_id, benchmark)
+                                // as its result card. Array reassign for reactivity.
+                                {
+                                    const idx = this.accAllResults.findIndex(
+                                        r => r.model_id === data.data.model_id
+                                          && r.benchmark === data.data.benchmark
+                                    );
+                                    if (idx >= 0) {
+                                        const updated = { ...this.accAllResults[idx], upload: data.data };
+                                        this.accAllResults.splice(idx, 1, updated);
+                                        this.accAllResults = [...this.accAllResults];
                                     }
                                 }
                                 break;
@@ -10141,8 +11084,18 @@
             // Theme select
             setTheme(theme) {
                 this.theme = theme;
-                localStorage.setItem('omlx-chat-theme', this.theme);
+                localStorage.setItem(THEME_STORAGE_KEY, this.theme);
                 this.applyTheme();
+            },
+
+            setEnhancedReadability(enabled) {
+                this.enhancedReadability = enabled;
+                localStorage.setItem(ENHANCED_READABILITY_KEY, enabled ? 'on' : 'off');
+                if (enabled) {
+                    document.documentElement.setAttribute('data-enhanced-readability', '');
+                } else {
+                    document.documentElement.removeAttribute('data-enhanced-readability');
+                }
             },
 
             applyTheme() {

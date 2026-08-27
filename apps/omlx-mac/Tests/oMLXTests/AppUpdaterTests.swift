@@ -16,11 +16,74 @@
 // staging flow needs live networking/hdiutil and isn't practical to drive
 // end-to-end in a unit test.
 
+// Upstream's staged-teardown ordering tests (finishStagedUpdate) are
+// kept alongside them; the two sets are independent.
+
 import Foundation
 import XCTest
 @testable import oMLX
 
+@MainActor
 final class AppUpdaterTests: XCTestCase {
+    private enum TestError: Error, Equatable {
+        case detachFailed
+        case removalFailed
+    }
+
+    func testReadyIsNotifiedOnlyAfterMountedResourcesAreReleased() throws {
+        var events: [String] = []
+
+        try AppUpdater.finishStagedUpdate(
+            detach: { events.append("detach") },
+            removeTemporaryFiles: { events.append("remove temporary files") },
+            notifyReady: { events.append("ready") }
+        )
+
+        XCTAssertEqual(events, [
+            "detach",
+            "remove temporary files",
+            "ready",
+        ])
+    }
+
+    func testDetachFailurePreventsTemporaryRemovalAndReadyNotification() {
+        var events: [String] = []
+
+        XCTAssertThrowsError(
+            try AppUpdater.finishStagedUpdate(
+                detach: {
+                    events.append("detach")
+                    throw TestError.detachFailed
+                },
+                removeTemporaryFiles: { events.append("remove temporary files") },
+                notifyReady: { events.append("ready") }
+            )
+        ) { error in
+            XCTAssertEqual(error as? TestError, .detachFailed)
+        }
+
+        XCTAssertEqual(events, ["detach"])
+    }
+
+    func testTemporaryRemovalFailurePreventsReadyNotification() {
+        var events: [String] = []
+
+        XCTAssertThrowsError(
+            try AppUpdater.finishStagedUpdate(
+                detach: { events.append("detach") },
+                removeTemporaryFiles: {
+                    events.append("remove temporary files")
+                    throw TestError.removalFailed
+                },
+                notifyReady: { events.append("ready") }
+            )
+        ) { error in
+            XCTAssertEqual(error as? TestError, .removalFailed)
+        }
+
+        XCTAssertEqual(events, ["detach", "remove temporary files"])
+    }
+
 
     /// A system app that's actually signed with a real Developer ID Team ID.
     /// Most `/System/Applications/*.app` bundles are Apple-platform-signed
