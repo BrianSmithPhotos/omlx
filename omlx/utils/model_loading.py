@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -119,7 +120,11 @@ def preflight_text_remote_code(
 
 
 def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwargs):
-    """Wrapper around mlx_lm.load that forwards trust_remote_code only when supported."""
+    """Forward the configured trust setting to the model and tokenizer loaders."""
+    kwargs["tokenizer_config"] = {
+        **(kwargs.get("tokenizer_config") or {}),
+        "trust_remote_code": trust_remote_code,
+    }
     preflight_text_remote_code(
         path_or_repo,
         tokenizer_config=kwargs.get("tokenizer_config"),
@@ -375,6 +380,36 @@ def _patch_mlx_lm_load_config() -> None:
     _MLX_LM_LOAD_CONFIG_PATCHED = True
 
 
+def _checkpoint_has_t5_weights(model_path: str | Path) -> bool:
+    """Detect t5 packing from tensor headers without materializing weights."""
+    import safetensors
+
+    weights = {}
+    scales = {}
+    for shard in sorted(Path(model_path).glob("*.safetensors")):
+        with safetensors.safe_open(str(shard), framework="numpy") as f:
+            for key in f.keys():
+                if key.endswith(".weight"):
+                    tensor = f.get_slice(key)
+                    if tensor.get_dtype() == "U8":
+                        weights[key[:-7]] = tensor.get_shape()
+                elif key.endswith(".scales"):
+                    scales[key[:-7]] = f.get_slice(key).get_shape()
+
+    for prefix, shape in weights.items():
+        scale_shape = scales.get(prefix)
+        if (
+            len(shape) == 2
+            and scale_shape is not None
+            and len(scale_shape) == 2
+            and shape[0] == scale_shape[0]
+            and scale_shape[1] > 0
+            and shape[1] in (13 * scale_shape[1], 26 * scale_shape[1])
+        ):
+            return True
+    return False
+
+
 def maybe_apply_pre_load_patches(
     model_name: str,
     model_settings: Any | None = None,
@@ -400,7 +435,7 @@ def maybe_apply_pre_load_patches(
       declares ``model_type == "glm_moe_dsa"``. Required because pinned
       mlx-lm exposes it as a bare DeepSeek-V3.2 subclass and cannot load
       checkpoints whose shared DSA layers carry no indexer weights.
-    - Native MTP patch (PR 990 + PR 15) when the config declares MTP heads
+    - Lightning MTP patch (PR 990 + PR 15) when the config declares MTP heads
       on a supported model_type. Always applied for sanitize correctness;
       head attachment is gated by ``model_settings.mtp_enabled``.
     - mlx-vlm side MTP runtime + nested-visual patches when ``for_vlm`` is
@@ -416,11 +451,38 @@ def maybe_apply_pre_load_patches(
       and crashes with KeyError unless the mlx_vlm_mtp sanitize replacement
       is installed first. ``for_vlm=True`` is only passed by
       ``VLMBatchedEngine``, so no separate ``vision_config`` gate is needed.
-    Both patches inject modules into ``sys.modules`` and replace mlx-lm
-    internals; gating keeps non-affected models at zero cost.
-
     Safe to call repeatedly; the patches are idempotent.
     """
+    from ..model_settings import validate_moe_expert_offload
+
+    if model_settings is not None:
+        validate_moe_expert_offload(
+            {
+                "moe_expert_offload_resident_fraction": getattr(
+                    model_settings, "moe_expert_offload_resident_fraction", 0.25
+                ),
+                **{
+                    key: getattr(model_settings, key, False)
+                    for key in (
+                        "moe_expert_offload_enabled",
+                        "mtp_enabled",
+                        "vlm_mtp_enabled",
+                        "dflash_enabled",
+                    )
+                },
+            }
+        )
+
+    if (
+        getattr(model_settings, "moe_expert_offload_enabled", False)
+        and os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") != "0"
+    ):
+        from ..patches.moe_offload_compat import moe_offload_compatibility
+
+        supported, reason = moe_offload_compatibility(model_name)
+        if not supported:
+            raise ValueError(reason)
+
     # Reset the process-wide MTP flag so non-MTP-compatible models (or
     # models with mtp_enabled=False) are not polluted by a prior model
     # load that left the flag True.
@@ -464,7 +526,8 @@ def maybe_apply_pre_load_patches(
     # wrapper chain bypasses us entirely.
     quant_cfg = config.get("quantization") or {}
     quant_bits = quant_cfg.get("bits") if isinstance(quant_cfg, dict) else None
-    if quant_bits in (1, 2):
+    # Ordinary 2-bit affine checkpoints do not need the t5 loading shim.
+    if quant_bits == 1 or (quant_bits == 2 and _checkpoint_has_t5_weights(model_name)):
         try:
             from ..patches.bonsai_t5_load import apply_bonsai_t5_load_patch
         except Exception as e:
@@ -496,7 +559,21 @@ def maybe_apply_pre_load_patches(
                 )
 
     model_type = config.get("model_type")
-    if isinstance(model_type, str) and model_type.startswith("deepseek_v4"):
+    if for_vlm and model_type in {"moondream1", "moondream2"}:
+        from ..patches.moondream2_compat import apply_moondream2_compat_patch
+
+        if apply_moondream2_compat_patch():
+            logger.info("Moondream2 compatibility patch applied for %s", model_name)
+
+    if model_type == "deepseek_v41":
+        from ..patches.deepseek_v41 import apply_patch
+
+        apply_patch()
+    if (
+        isinstance(model_type, str)
+        and model_type.startswith("deepseek_v4")
+        and not model_type.startswith("deepseek_v41")
+    ):
         from ..patches.deepseek_v4 import apply_deepseek_v4_patch
 
         if apply_deepseek_v4_patch():
@@ -528,6 +605,12 @@ def maybe_apply_pre_load_patches(
         if apply_laguna_patch():
             logger.info("Laguna pre-load patch applied for %s", model_name)
 
+    if model_type == "k2_horizon":
+        from ..patches.k2_horizon import apply_k2_horizon_patch
+
+        if apply_k2_horizon_patch():
+            logger.info("K2 Horizon pre-load patch applied for %s", model_name)
+
     if model_type == "hy_v3":
         from ..patches.hy_v3 import apply_hy_v3_patch
 
@@ -549,7 +632,6 @@ def maybe_apply_pre_load_patches(
 
         if apply_glm_moe_dsa_patch():
             logger.info("GLM MoE DSA pre-load patch applied for %s", model_name)
-
     minimax_m3_types = {"minimax_m3", "minimax_m3_vl"}
     if not for_vlm and (
         model_type in minimax_m3_types or text_model_type in minimax_m3_types
@@ -821,7 +903,7 @@ def maybe_apply_pre_load_patches(
                             "weights to bind)",
                             model_name,
                         )
-                if apply_mlx_vlm_mtp_runtime_patch():
+                if apply_mlx_vlm_mtp_runtime_patch(model_type):
                     if not has_mtp_weights:
                         logger.info(
                             "mlx-vlm runtime MTP patch applied for %s "
@@ -914,17 +996,17 @@ def maybe_apply_pre_load_patches(
         try:
             from ..patches.bonsai_qmv import apply_bonsai_qmv_patch
         except Exception as e:
-            logger.debug("bonsai qmv patch import failed: %s", e)
+            logger.debug("1/2-bit affine decode optimization import failed: %s", e)
         else:
             if apply_bonsai_qmv_patch():
                 logger.info(
-                    "Bonsai %d-bit qmv decode patch applied for %s",
+                    "%d-bit affine decode optimization enabled for %s",
                     quant_bits,
                     model_name,
                 )
             else:
                 logger.debug(
-                    "Bonsai qmv patch skipped for %s "
+                    "1/2-bit affine decode optimization skipped for %s "
                     "(native extension not available; stock mlx fallback active)",
                     model_name,
                 )
@@ -1002,14 +1084,68 @@ def _nextn_weight_prefixes(model_path: str | Path) -> tuple[str, ...]:
         config = json.loads((Path(model_path) / "config.json").read_text())
     except Exception:
         return ()
+    if config.get("model_type") == "qwen4_exp":
+        # The dedicated Qwen4 runtime constructs a root-level MTP module and
+        # can bind only the embedded mtp.* layouts. Extra nextn decoder layers
+        # must not make generic callers report this checkpoint as compatible.
+        return ()
     return _nextn_weight_prefixes_from_config(config)
+
+
+def _checkpoint_weight_prefix(
+    model_path: str | Path,
+    prefixes: tuple[str, ...],
+) -> str | None:
+    """Return the first supported prefix present in a checkpoint."""
+    p = Path(model_path)
+    if not p.is_dir():
+        return None
+
+    index_path = p / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            data = json.loads(index_path.read_text())
+            weight_map = data.get("weight_map") or {}
+            for prefix in prefixes:
+                if any(key.startswith(prefix) for key in weight_map):
+                    return prefix
+            return None
+        except Exception as e:
+            logger.debug("Failed to read %s for mtp weight scan: %s", index_path, e)
+
+    shards = sorted(p.glob("*.safetensors"))
+    if not shards:
+        return None
+    try:
+        import safetensors
+    except Exception as e:
+        logger.debug("safetensors import failed for mtp weight scan: %s", e)
+        return None
+
+    for shard in shards:
+        try:
+            with safetensors.safe_open(str(shard), framework="numpy") as f:
+                keys = tuple(f.keys())
+                for prefix in prefixes:
+                    if any(key.startswith(prefix) for key in keys):
+                        return prefix
+        except Exception as e:
+            logger.debug("Failed to read %s header for mtp weight scan: %s", shard, e)
+    return None
+
+
+def _checkpoint_qwen4_mtp_weight_prefix(model_path: str | Path) -> str | None:
+    """Return the embedded MTP prefix supported by the Qwen4 runtime."""
+    return _checkpoint_weight_prefix(model_path, _MTP_WEIGHT_PREFIXES)
 
 
 def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     """True iff the checkpoint at *model_path* ships any MTP weight tensor.
 
-    Matches both the ``mtp.*`` naming and the nextn layout (extra decoder
-    layers past ``num_hidden_layers``, see ``_nextn_weight_prefixes``).
+    Matches both the ``mtp.*`` naming and compatible nextn layouts (extra
+    decoder layers past ``num_hidden_layers``, see ``_nextn_weight_prefixes``).
+    Qwen4-Exp is intentionally restricted to ``mtp.*`` because its dedicated
+    runtime cannot bind native nextn layers.
 
     Some Qwen3.6 MoE VLM exports declare ``mtp_num_hidden_layers > 0`` in
     ``config.json`` but strip the MTP weights during conversion (e.g.
@@ -1023,39 +1159,8 @@ def _checkpoint_has_mtp_weights(model_path: str | Path) -> bool:
     False when neither resolves — callers treat that as "no MTP weights"
     (the conservative choice: skip MTPModule attachment).
     """
-    p = Path(model_path)
-    if not p.is_dir():
-        return False
-
-    prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(p)
-
-    index_path = p / "model.safetensors.index.json"
-    if index_path.exists():
-        try:
-            data = json.loads(index_path.read_text())
-            weight_map = data.get("weight_map") or {}
-            return any(k.startswith(prefixes) for k in weight_map)
-        except Exception as e:
-            logger.debug("Failed to read %s for mtp weight scan: %s", index_path, e)
-
-    shards = sorted(p.glob("*.safetensors"))
-    if not shards:
-        return False
-    try:
-        import safetensors
-    except Exception as e:
-        logger.debug("safetensors import failed for mtp weight scan: %s", e)
-        return False
-
-    for shard in shards:
-        try:
-            with safetensors.safe_open(str(shard), framework="numpy") as f:
-                for k in f.keys():
-                    if k.startswith(prefixes):
-                        return True
-        except Exception as e:
-            logger.debug("Failed to read %s header for mtp weight scan: %s", shard, e)
-    return False
+    prefixes = _MTP_WEIGHT_PREFIXES + _nextn_weight_prefixes(model_path)
+    return _checkpoint_weight_prefix(model_path, prefixes) is not None
 
 
 def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
@@ -1077,6 +1182,7 @@ def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:
         or model_type.startswith("deepseek_v4")
         or model_type.startswith("nemotron_h")
         or model_type == "glm_moe_dsa"
+        or model_type == "glm5_next"
         or model_type in ("gemma4", "gemma4_unified")
         or model_type in ("inkling", "inkling_mm_model")
         or model_type == "step3p7"

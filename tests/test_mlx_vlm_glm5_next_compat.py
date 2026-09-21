@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import importlib
 import io
 import json
@@ -272,7 +273,7 @@ def test_tiny_text_prefill_decode_and_batch_match():
     assert type(sparse_cache[1]).__name__ == "PoolingCache"
 
     generate = importlib.import_module("mlx_lm.generate")
-    batch_cache = generate._make_cache(model, [0, 0], None)
+    batch_cache = generate._merge_caches([model.make_cache(), model.make_cache()])
     batch_tokens = mx.concatenate([prompt, prompt], axis=0)
     batch_logits = model(batch_tokens, cache=batch_cache).logits
     left_logits = model(prompt, cache=model.make_cache()).logits
@@ -282,6 +283,51 @@ def test_tiny_text_prefill_decode_and_batch_match():
     assert type(batch_cache[1][1]).__name__ == "BatchPoolingCache"
     assert mx.allclose(batch_logits[:1], left_logits, atol=3e-4).item()
     assert mx.allclose(batch_logits[1:], right_logits, atol=3e-4).item()
+
+
+@pytest.mark.parametrize("batch_size,block_size", [(1, 2), (2, 4), (3, 8), (4, 2)])
+def test_short_verify_keeps_latent_kv_and_matches_decode(
+    batch_size, block_size, monkeypatch
+):
+    from mlx_lm.models.mla import MultiLinear
+    from mlx_vlm.models.glm5_next.language import LanguageModel
+
+    mx.random.seed(937)
+    config = _tiny_config()
+    config.text_config.index_topk = 64
+    model = LanguageModel(config.text_config, config)
+    prompt = mx.arange(batch_size * 12).reshape(batch_size, 12) % 100
+    row_caches = []
+    for row in range(batch_size):
+        row_cache = model.make_cache()
+        mx.eval(model(prompt[row : row + 1, row:], cache=row_cache).logits)
+        row_caches.append(row_cache)
+    cache = [type(rows[0]).merge(rows) for rows in zip(*row_caches)]
+    reference_cache = copy.deepcopy(cache)
+    block = mx.arange(batch_size * block_size).reshape(batch_size, block_size) + 32
+    attention = model.model.layers[1].self_attn
+    projections = []
+    original = MultiLinear.__call__
+
+    def traced(self, x, *args, **kwargs):
+        if self is attention.embed_q or self is attention.unembed_out:
+            projections.append(x.shape[-2])
+        return original(self, x, *args, **kwargs)
+
+    monkeypatch.setattr(MultiLinear, "__call__", traced)
+    verified = model(block, cache=cache).logits
+    mx.eval(verified)
+    # Project the short query/output block, never all cached keys and values.
+    assert projections == [block_size, block_size]
+    sequential = mx.concatenate(
+        [
+            model(block[:, i : i + 1], cache=reference_cache).logits
+            for i in range(block_size)
+        ],
+        axis=1,
+    )
+    mx.eval(sequential)
+    assert mx.allclose(verified, sequential, atol=3e-4, rtol=3e-4).item()
 
 
 def test_variable_length_batch_matches_single_request_greedy_tokens():
@@ -492,6 +538,31 @@ def test_sanitize_and_oq_keep_sensitive_parameters_in_fp32():
     ) == {"bits": 8, "group_size": 64, "mode": "affine"}
 
 
+def test_sanitize_remaps_quantized_forget_gate_sidecars():
+    from mlx_vlm.models.glm5_next.language import LanguageModel
+
+    config = _tiny_config()
+    model = LanguageModel(config.text_config, config)
+    prefix = "language_model.model.layers.0.self_attn."
+    weights = {
+        prefix + "f_a_proj.weight": mx.ones((32, 32)),
+        prefix + "f_a_proj.scales": mx.ones((2,), dtype=mx.bfloat16),
+        prefix + "f_a_proj.biases": mx.ones((2,), dtype=mx.bfloat16),
+        prefix + "f_b_proj.weight": mx.ones((32, 32)),
+        prefix + "f_b_proj.scales": mx.ones((2,), dtype=mx.bfloat16),
+        prefix + "f_b_proj.biases": mx.ones((2,), dtype=mx.bfloat16),
+    }
+    sanitized = model.sanitize(dict(weights))
+    gate = prefix + "forget_gate."
+    for proj in ("f_a_proj", "f_b_proj"):
+        for part in ("weight", "scales", "biases"):
+            assert gate + proj + "." + part in sanitized
+    assert not any(
+        key.startswith(prefix + "f_") and ".forget_gate." not in key
+        for key in sanitized
+    )
+
+
 def test_vector_gate_kernel_matches_reference_with_padding_mask():
     from mlx_vlm.models.glm5_next.gated_delta import gated_delta_update
 
@@ -649,4 +720,67 @@ def test_glm5_next_q8_indexer_prefill_uses_shared_qmm_kernel(monkeypatch):
     mx.eval(actual, reference)
 
     assert calls == 1
+    assert mx.allclose(actual, reference, atol=2e-3, rtol=2e-3).item()
+
+
+@pytest.mark.parametrize(("bits", "tokens"), [(5, 128), (8, 1024)])
+def test_glm5_next_prefill_qmm_handles_strided_input(bits, tokens):
+    import mlx.nn as nn
+    from mlx_vlm.models.glm5_next.linear import linear_forward
+
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    name = f"qwen35_q{bits}_affine_qmm_t"
+    if not fast.has_symbol(name):
+        pytest.skip(f"{name} native kernel is not built")
+
+    mx.random.seed(11)
+    dims = 128
+    base = nn.Linear(dims, dims, bias=False)
+    base.set_dtype(mx.float16)
+    linear = base.to_quantized(group_size=64, bits=bits, mode="affine")
+
+    wide = mx.random.normal((1, tokens, 2 * dims), dtype=mx.float16)
+    mx.eval(wide)
+    strided = mx.split(wide, [dims], axis=-1)[1]
+
+    reference = linear(strided)
+    actual = linear_forward(linear, strided)
+    mx.eval(actual, reference)
+
+    assert mx.allclose(actual, reference, atol=2e-3, rtol=2e-3).item()
+
+
+@pytest.mark.parametrize(("bits", "tokens"), [(5, 128), (8, 1024)])
+def test_glm5_next_fused_qmm_handles_strided_input(bits, tokens):
+    import mlx.nn as nn
+    from mlx_vlm.models.glm5_next.linear import fused_quantized_matmul
+
+    from omlx.custom_kernels.qwen35_prefill import fast
+
+    name = f"qwen35_q{bits}_affine_qmm_t"
+    if not fast.has_symbol(name):
+        pytest.skip(f"{name} native kernel is not built")
+
+    mx.random.seed(11)
+    dims = 128
+    base = nn.Linear(dims, dims, bias=False)
+    base.set_dtype(mx.float16)
+    linear = base.to_quantized(group_size=64, bits=bits, mode="affine")
+
+    wide = mx.random.normal((1, tokens, 2 * dims), dtype=mx.float16)
+    mx.eval(wide)
+    strided = mx.split(wide, [dims], axis=-1)[1]
+
+    reference = linear(strided)
+    actual = fused_quantized_matmul(
+        strided,
+        linear.weight,
+        linear.scales,
+        linear.biases,
+        bits=bits,
+        group_size=64,
+    )
+    mx.eval(actual, reference)
+
     assert mx.allclose(actual, reference, atol=2e-3, rtol=2e-3).item()

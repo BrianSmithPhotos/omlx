@@ -8,7 +8,9 @@ with SSD persistence. oMLX only supports paged SSD-based caching.
 
 import logging
 import math
+import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -21,6 +23,9 @@ except ImportError:
     HAS_MLX = False
 
 from ._rotating_subclass import PrefillReadyRotatingKVCache
+from .deepseek_v41_delta import DELTA_CLASS as V41_DELTA_CLASS
+from .deepseek_v41_delta import compact_state as compact_v41_state
+from .deepseek_v41_delta import restore_chain as restore_v41_chain
 from .hybrid_cache import ModelCacheConfig
 from .interface import CacheManager
 from .paged_cache import (
@@ -31,16 +36,17 @@ from .paged_cache import (
     compute_block_hash,
     resolve_block_extra_keys,
 )
-from .paged_ssd_cache import _PM_SLICEABLE_SUB_CLASSES, PagedSSDCacheManager
+from .paged_ssd_cache import (
+    _PM_BOUNDARY_SUB_CLASSES,
+    _PM_SLICEABLE_SUB_CLASSES,
+    PagedSSDCacheManager,
+)
 from .pooling_delta import POOLING_CACHE_DELTA_CLASS
 from .stats import PrefixCacheStats
 from .type_registry import CacheTypeRegistry
 
-# Non-sliceable CacheList member classes safe for per-member block storage.
-# PoolingCache (delta chains) and rotating families keep the legacy
-# cumulative path; ArraysCache state is small, positionless, and
-# self-contained at every boundary.
-_PM_SAFE_NON_SLICEABLE_SUBS = frozenset({"ArraysCache", "SizedArraysCache"})
+# Shared with class-level signature eligibility.
+_PM_SAFE_NON_SLICEABLE_SUBS = _PM_BOUNDARY_SUB_CLASSES
 
 
 def cachelist_pm_member_plan(
@@ -51,9 +57,9 @@ def cachelist_pm_member_plan(
 
     Returns a list aligned with the sub-caches: ``"slice"`` for 4D
     sliceable KV members (stored as true per-block slices), ``"boundary"``
-    for ArraysCache-style members (stored from the block's boundary
+    for ArraysCache or pooling members (stored from the block's boundary
     snapshot). ``None`` means the layer is not eligible for per-member
-    storage (missing class info, unknown / PoolingCache / rotating
+    storage (missing class info, unknown or rotating
     members, or nothing to slice) and must use the legacy cumulative
     last-block-only path.
 
@@ -98,6 +104,16 @@ _TIP_LINEAGE_MAX_ENTRIES = 4096
 # lineage map.
 _BACKFILL_CHECKED_MAX_ENTRIES = 4096
 
+# Lightning-MTP prompt priming has one small attention cache of its own.  The
+# normal prefix cache stores only the backbone cache, so a warm trunk restore
+# used to lose the MTP history and restart speculative decode unprimed.  Keep a
+# deliberately tiny in-memory sidecar of full-block boundary snapshots.  Four
+# entries bounds the worst-case Qwen4 100K-context footprint to roughly the
+# same order as one ordinary request cache while covering the recent branches
+# of an interactive conversation.  The entries are keyed by the *same* chain
+# hash as the backbone block and are dropped with that block/hash lifecycle.
+_MTP_PREFIX_SNAPSHOT_MAX_ENTRIES = 4
+
 
 def _wrap_cachelist_sub_marker(
     sub_idx: int,
@@ -120,6 +136,9 @@ def _wrap_cachelist_sub_marker(
     return ("__nstate__", name, list(elements))
 _EXACT_PREFIX_TERMINAL_KEY = "specprefill-static-exact-v1"
 _POOLING_CACHE_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
+# Sentinel: the CacheList restore chain carries no PoolingCacheDelta
+# markers, so the caller restores the boundary member last-block-wins.
+_NO_POOLING_DELTA = object()
 
 
 def _contains_pooling_cache_state(cache_data: list[Any]) -> bool:
@@ -246,6 +265,16 @@ class BlockAwarePrefixCache(CacheManager):
         # for boundary-snapshot backfill this session (real state found or
         # rewrite saved). Each hash is inspected at most once per run.
         self._backfill_checked_hashes: set[bytes] = set()
+
+        # Full-block Lightning-MTP prompt-history snapshots.  Values are
+        # opaque to the generic prefix cache; prompt_priming owns their shape.
+        # Access can race with the asynchronous backbone store worker's hash
+        # callbacks, so use a private lock rather than relying on the GIL for
+        # the multi-step LRU operations.
+        self._mtp_prefix_snapshots: OrderedDict[bytes, tuple[int, Any]] = (
+            OrderedDict()
+        )
+        self._mtp_prefix_snapshot_lock = threading.RLock()
 
         # Callback for restoring cold blocks (deprecated in paged SSD-only mode)
         # Kept for API compatibility
@@ -907,6 +936,27 @@ class BlockAwarePrefixCache(CacheManager):
         require_contiguous_pooling_snapshots = bool(
             boundary_snapshots
         ) and _contains_pooling_cache_state(cache_data)
+        snapshot_base_tokens = 0
+        if boundary_snapshots and not pm_layers_present:
+            first_boundary = min(boundary_snapshots.keys())
+            first_snapshot = (
+                boundary_snapshots[first_boundary]
+                if first_boundary > self.block_size else None
+            )
+            if first_snapshot and len(first_snapshot) == len(cache_data):
+                complete = all(
+                    not CacheTypeRegistry.get_handler_by_class_name(
+                        layer.get("class_name", "KVCache")
+                    ).supports_block_slicing
+                    for layer in first_snapshot
+                )
+                for layer in first_snapshot:
+                    for span in layer.get("pooling_delta_ranges", {}).values():
+                        complete = complete and span[0] == 0
+                if complete:
+                    # A full snapshot can follow an indivisible image prefix.
+                    snapshot_base_tokens = first_boundary
+
         # Supersede-on-extend tracking (rotating models only, see below).
         first_new_block_idx: int | None = None
         tip_block_saved = False
@@ -945,6 +995,7 @@ class BlockAwarePrefixCache(CacheManager):
             # intermediate snapshot.
             if (
                 require_contiguous_pooling_snapshots
+                and global_end >= snapshot_base_tokens
                 and not is_last_block
                 and not has_boundary_snapshot
             ):
@@ -1158,6 +1209,7 @@ class BlockAwarePrefixCache(CacheManager):
                 #      longer needs cache_data's live seq_len for them.
                 if (
                     snapshot_cache_data is None
+                    and global_end >= snapshot_base_tokens
                     and not is_last_block
                     and cache_seq_len > 0
                     and cache_start >= cache_seq_len
@@ -1568,8 +1620,10 @@ class BlockAwarePrefixCache(CacheManager):
             return None
 
         try:
-            if promote_to_hot_cache:
-                self.preload_blocks(block_table)
+            # reconstruct_cache performs the same SSD load and promotes each
+            # block as it is consumed.  preload_blocks is serialized for Metal
+            # safety, so running it here would deserialize the exact chain
+            # twice before returning it.
             restored_cache = self.reconstruct_cache(
                 block_table,
                 promote_to_hot_cache=promote_to_hot_cache,
@@ -1653,6 +1707,15 @@ class BlockAwarePrefixCache(CacheManager):
         """
         if not cache_data:
             return 0
+
+        # V4.1 stores packed rows and a bounded window rather than a 4D KV
+        # tensor. Its first state slot records the absolute token position,
+        # including any prefix restored before this request's prefill.
+        for layer in cache_data:
+            if layer.get("class_name") == "DeepseekV41Cache":
+                state = layer.get("state", ())
+                if len(state) in (7, 8) and state[0].shape == (1,):
+                    return int(state[0].item())
 
         # Non-sliceable cache types use sliding window or have no sequence dimension
         # RotatingKVCache: sliding window, seq_len limited to max_size
@@ -1933,7 +1996,16 @@ class BlockAwarePrefixCache(CacheManager):
         if self.paged_ssd_cache is None or not HAS_MLX:
             return True
         try:
-            data, meta = self.paged_ssd_cache.load_block_with_metadata(block_hash)
+            # Inspection load only: do not promote into the hot cache. A
+            # legacy-cumulative block (pm-ineligible CacheList layouts, e.g.
+            # CacheList(KVCache, PoolingCache)) carries the full cumulative
+            # KV prefix; promoting every inspected block retains those
+            # oversized payloads in RAM for nothing when the common outcome
+            # is "payload already real, no rewrite" (#3226).
+            data, meta = self.paged_ssd_cache.load_block_with_metadata(
+                block_hash,
+                promote_to_hot_cache=False,
+            )
             if not data or not meta:
                 return False
             types = meta.get("layer_cache_types") or []
@@ -2348,6 +2420,7 @@ class BlockAwarePrefixCache(CacheManager):
                     # legacy quadratic cumulative-per-block layout.
                     pm_plan = cachelist_pm_member_plan(sub_class_names, state)
                     pm_snapshot_state = None
+                    pm_snapshot_layer: dict[str, Any] = {}
                     if (
                         snapshot_cache_data is not None
                         and layer_idx < len(snapshot_cache_data)
@@ -2355,7 +2428,8 @@ class BlockAwarePrefixCache(CacheManager):
                             snapshot_cache_data[layer_idx].get("state"), list
                         )
                     ):
-                        pm_snapshot_state = snapshot_cache_data[layer_idx]["state"]
+                        pm_snapshot_layer = snapshot_cache_data[layer_idx]
+                        pm_snapshot_state = pm_snapshot_layer["state"]
                     # See the rotating-family branch above (A1): a missing
                     # boundary snapshot must fall to the placeholder path
                     # even on the last block, unless the caller has verified
@@ -2390,6 +2464,16 @@ class BlockAwarePrefixCache(CacheManager):
                             )
                         block_slices.append(("__cache_list__", sub_tensors))
                     elif pm_source_ok:
+                        # The scheduler promotes the final boundary into
+                        # cache_data and omits it from intermediate snapshots.
+                        # Read delta ranges from the same source as the state;
+                        # an unmarked final delta would reset the pooled history.
+                        pm_source_layer = (
+                            pm_snapshot_layer if pm_has_snapshot else layer_state
+                        )
+                        pm_pooling_delta_ranges = (
+                            pm_source_layer.get("pooling_delta_ranges") or {}
+                        )
                         sub_tensors = []
                         for sub_idx, sub_state in enumerate(state):
                             if pm_plan[sub_idx] == "slice":
@@ -2416,7 +2500,28 @@ class BlockAwarePrefixCache(CacheManager):
                                 )
                                 for elem in source
                             ]
-                            sub_tensors.append(_wrap_sub_marker(sub_idx, cloned))
+                            # Preserve absolute pooled-row ranges for chain reconstruction.
+                            delta_range = pm_pooling_delta_ranges.get(str(sub_idx))
+                            sub_class = (
+                                sub_class_names[sub_idx]
+                                if sub_idx < len(sub_class_names)
+                                else None
+                            )
+                            if (
+                                sub_class == "PoolingCache"
+                                and isinstance(delta_range, (list, tuple))
+                                and len(delta_range) == 2
+                            ):
+                                cloned.append(mx.array(delta_range, dtype=mx.int64))
+                                sub_tensors.append(
+                                    _wrap_sub_marker(
+                                        sub_idx,
+                                        cloned,
+                                        POOLING_CACHE_DELTA_CLASS,
+                                    )
+                                )
+                            else:
+                                sub_tensors.append(_wrap_sub_marker(sub_idx, cloned))
                         block_slices.append(("__cache_list_pm__", sub_tensors))
                     else:
                         # Non-sliceable sub-caches: last-block-only or snapshot.
@@ -2490,6 +2595,21 @@ class BlockAwarePrefixCache(CacheManager):
                             if has_snapshot
                             else layer_state["state"]
                         )
+                        marker_class = cache_type_name
+                        if cache_type_name == "DeepseekV41Cache":
+                            source_layer = (
+                                snapshot_cache_data[layer_idx]
+                                if has_snapshot
+                                else layer_state
+                            )
+                            state = compact_v41_state(
+                                state,
+                                source_layer.get("meta_state", ()),
+                                start_idx,
+                                end_idx,
+                            )
+                            if len(state) == 8:
+                                marker_class = V41_DELTA_CLASS
                         if isinstance(state, (list, tuple)) and len(state) > 2:
                             cloned = [
                                 (
@@ -2499,7 +2619,7 @@ class BlockAwarePrefixCache(CacheManager):
                                 )
                                 for elem in state
                             ]
-                            block_slices.append(("__nstate__", cache_type_name, cloned))
+                            block_slices.append(("__nstate__", marker_class, cloned))
                         elif isinstance(state, (list, tuple)) and len(state) >= 2:
                             conv_state = (
                                 state[0] if state[0] is not None else mx.array([])
@@ -3489,6 +3609,102 @@ class BlockAwarePrefixCache(CacheManager):
                         for elems in last_block_elements
                     )
 
+                    def _rebuild_pooling_delta_sub(
+                        j: int,
+                        _block_data: list[Any] = cl_block_data,
+                        _layer_idx: int = layer_idx,
+                    ) -> Any:
+                        """Rebuild pooled rows, using cumulative snapshots as new bases.
+
+                        Return _NO_POOLING_DELTA for an unmarked chain or None for an invalid chain.
+                        """
+                        if not any(
+                            _sub_state_class(bd[j]) == POOLING_CACHE_DELTA_CLASS
+                            for bd in _block_data
+                        ):
+                            return _NO_POOLING_DELTA
+
+                        pooled_parts: list[Any] = []
+                        pooled_length = 0
+                        last_pooling_state: list[Any] | None = None
+                        valid_pooling_chain = True
+                        for block_cache_list in _block_data:
+                            sub_state = block_cache_list[j]
+                            elements = _sub_state_elements(sub_state)
+                            marker_class = _sub_state_class(sub_state)
+                            if elements is None:
+                                valid_pooling_chain = False
+                                break
+
+                            if marker_class != POOLING_CACHE_DELTA_CLASS:
+                                if len(elements) < 3:
+                                    valid_pooling_chain = False
+                                    break
+                                if elements[2] is None:
+                                    pooled_parts = []
+                                    pooled_length = 0
+                                elif (
+                                    hasattr(elements[2], "shape")
+                                    and len(elements[2].shape) >= 2
+                                ):
+                                    pooled_parts = [elements[2]]
+                                    pooled_length = int(elements[2].shape[1])
+                                else:
+                                    valid_pooling_chain = False
+                                    break
+                                last_pooling_state = list(elements)
+                                continue
+
+                            if (
+                                len(elements) not in (4, 6)
+                                or not hasattr(elements[2], "shape")
+                                or len(elements[2].shape) < 2
+                                or not hasattr(elements[-1], "tolist")
+                            ):
+                                valid_pooling_chain = False
+                                break
+                            try:
+                                delta_range = elements[-1].tolist()
+                                delta_start, delta_end = (
+                                    int(delta_range[0]),
+                                    int(delta_range[1]),
+                                )
+                            except (IndexError, TypeError, ValueError):
+                                valid_pooling_chain = False
+                                break
+                            if (
+                                delta_start != pooled_length
+                                or delta_end < delta_start
+                                or int(elements[2].shape[1])
+                                != delta_end - delta_start
+                            ):
+                                valid_pooling_chain = False
+                                break
+                            pooled_parts.append(elements[2])
+                            pooled_length = delta_end
+                            last_pooling_state = list(elements[:-1])
+
+                        if (
+                            not valid_pooling_chain
+                            or not pooled_parts
+                            or last_pooling_state is None
+                        ):
+                            logger.info(
+                                "CacheList layer %d sub-cache %d: invalid "
+                                "PoolingCache delta chain. Rejecting cache.",
+                                _layer_idx,
+                                j,
+                            )
+                            return None
+
+                        pooled = (
+                            pooled_parts[0]
+                            if len(pooled_parts) == 1
+                            else mx.concatenate(pooled_parts, axis=1)
+                        )
+                        last_pooling_state[2] = pooled
+                        return tuple(last_pooling_state)
+
                     pm_mode = any(cl_block_pm_flags)
                     if pm_mode and not all(cl_block_pm_flags):
                         # A chain mixing legacy cumulative blocks with
@@ -3576,7 +3792,18 @@ class BlockAwarePrefixCache(CacheManager):
                                         cat_elements.append(column[-1])
                                 concatenated_sub_states.append(tuple(cat_elements))
                             else:
-                                concatenated_sub_states.append(tuple(elems_last))
+                                # Boundary member (or single-block slice sub):
+                                # rebuild a PoolingCache delta chain when one
+                                # exists; otherwise the last block's state is
+                                # authoritative at that boundary.
+                                rebuilt = _rebuild_pooling_delta_sub(j)
+                                if rebuilt is None:
+                                    return None
+                                concatenated_sub_states.append(
+                                    tuple(elems_last)
+                                    if rebuilt is _NO_POOLING_DELTA
+                                    else rebuilt
+                                )
 
                         # Defense-in-depth (#2550 review): the restored KV
                         # length must equal the matched token count. A chain
@@ -3647,99 +3874,17 @@ class BlockAwarePrefixCache(CacheManager):
                         # every sub at its boundary. PoolingCache V4 markers
                         # are the exception: their append-only pooled tensor
                         # is stored as an absolute-range delta per block and
-                        # must be rebuilt in order. A legacy full snapshot may
-                        # appear before V4 deltas in an existing cache chain;
-                        # it becomes the reconstruction base.
+                        # must be rebuilt in order (shared helper).
                         concatenated_sub_states = []
                         for j, last_elements in enumerate(last_block_elements):
-                            has_pooling_deltas = any(
-                                _sub_state_class(bd[j]) == POOLING_CACHE_DELTA_CLASS
-                                for bd in cl_block_data
-                            )
-                            if not has_pooling_deltas:
-                                concatenated_sub_states.append(tuple(last_elements))
-                                continue
-
-                            pooled_parts = []
-                            pooled_length = 0
-                            last_pooling_state = None
-                            valid_pooling_chain = True
-                            for block_cache_list in cl_block_data:
-                                sub_state = block_cache_list[j]
-                                elements = _sub_state_elements(sub_state)
-                                marker_class = _sub_state_class(sub_state)
-                                if elements is None:
-                                    valid_pooling_chain = False
-                                    break
-
-                                if marker_class != POOLING_CACHE_DELTA_CLASS:
-                                    if len(elements) < 3:
-                                        valid_pooling_chain = False
-                                        break
-                                    if elements[2] is None:
-                                        pooled_parts = []
-                                        pooled_length = 0
-                                    elif (
-                                        hasattr(elements[2], "shape")
-                                        and len(elements[2].shape) >= 2
-                                    ):
-                                        pooled_parts = [elements[2]]
-                                        pooled_length = int(elements[2].shape[1])
-                                    else:
-                                        valid_pooling_chain = False
-                                        break
-                                    last_pooling_state = list(elements)
-                                    continue
-
-                                if (
-                                    len(elements) not in (4, 6)
-                                    or not hasattr(elements[2], "shape")
-                                    or len(elements[2].shape) < 2
-                                    or not hasattr(elements[-1], "tolist")
-                                ):
-                                    valid_pooling_chain = False
-                                    break
-                                try:
-                                    delta_range = elements[-1].tolist()
-                                    delta_start, delta_end = (
-                                        int(delta_range[0]),
-                                        int(delta_range[1]),
-                                    )
-                                except (IndexError, TypeError, ValueError):
-                                    valid_pooling_chain = False
-                                    break
-                                if (
-                                    delta_start != pooled_length
-                                    or delta_end < delta_start
-                                    or int(elements[2].shape[1])
-                                    != delta_end - delta_start
-                                ):
-                                    valid_pooling_chain = False
-                                    break
-                                pooled_parts.append(elements[2])
-                                pooled_length = delta_end
-                                last_pooling_state = list(elements[:-1])
-
-                            if (
-                                not valid_pooling_chain
-                                or not pooled_parts
-                                or last_pooling_state is None
-                            ):
-                                logger.info(
-                                    "CacheList layer %d sub-cache %d: invalid "
-                                    "PoolingCache delta chain. Rejecting cache.",
-                                    layer_idx,
-                                    j,
-                                )
+                            rebuilt = _rebuild_pooling_delta_sub(j)
+                            if rebuilt is None:
                                 return None
-
-                            pooled = (
-                                pooled_parts[0]
-                                if len(pooled_parts) == 1
-                                else mx.concatenate(pooled_parts, axis=1)
+                            concatenated_sub_states.append(
+                                tuple(last_elements)
+                                if rebuilt is _NO_POOLING_DELTA
+                                else rebuilt
                             )
-                            last_pooling_state[2] = pooled
-                            concatenated_sub_states.append(tuple(last_pooling_state))
 
                     # Build meta_state with correct offsets for reconstructed
                     # sequence length (may differ from original if partial match)
@@ -4057,6 +4202,15 @@ class BlockAwarePrefixCache(CacheManager):
                         )
                         return None
                     reconstructed_caches.append(cache)
+                    continue
+
+                if cache_type_name == "DeepseekV41Cache":
+                    restored = restore_v41_chain(
+                        [block[layer_idx] for block in all_block_data],
+                        [metas[layer_idx] for metas in all_block_meta_states],
+                        valid_token_count,
+                    )
+                    reconstructed_caches.append(restored)
                     continue
 
                 # === Generic N-tuple non-sliceable cache: use latest boundary ===
@@ -4748,10 +4902,113 @@ class BlockAwarePrefixCache(CacheManager):
         from any thread; it must not call back into the paged cache.
         """
         self._prefix_index.pop(block_hash, None)
+        with self._mtp_prefix_snapshot_lock:
+            self._mtp_prefix_snapshots.pop(block_hash, None)
 
     def _on_hash_map_cleared(self) -> None:
         """Drop all prefix-index entries after a wholesale hash-map clear."""
         self._prefix_index.clear()
+        with self._mtp_prefix_snapshot_lock:
+            self._mtp_prefix_snapshots.clear()
+
+    def _mtp_prefix_chain_tip(
+        self,
+        tokens: list[int],
+        boundary_tokens: int,
+        *,
+        extra_keys: tuple[Any, ...] | None = None,
+        extra_key_token_start: int | None = None,
+        extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
+    ) -> bytes | None:
+        """Return the ordinary full-block chain hash for an MTP sidecar.
+
+        VLM requests can change hidden states without changing token ids.  The
+        generic prefix cache supports per-range media keys, but
+        ``compute_chain_hashes`` cannot reproduce that resolution from a lone
+        boundary snapshot.  Fail closed for those two complex forms; text-only
+        requests and a single request-wide ``extra_keys`` tuple remain exact.
+        """
+        boundary_tokens = int(boundary_tokens)
+        if (
+            boundary_tokens <= 0
+            or boundary_tokens > len(tokens)
+            or boundary_tokens % self.block_size != 0
+            or extra_key_token_start is not None
+            or extra_key_ranges is not None
+        ):
+            return None
+        parent_hash: BlockHash | None = None
+        for start in range(0, boundary_tokens, self.block_size):
+            parent_hash = compute_block_hash(
+                parent_hash,
+                tokens[start : start + self.block_size],
+                extra_keys=extra_keys,
+                model_name=self.paged_cache.model_name,
+            )
+        return parent_hash
+
+    def store_mtp_prefix_snapshot(
+        self,
+        tokens: list[int],
+        boundary_tokens: int,
+        snapshot: Any,
+        *,
+        extra_keys: tuple[Any, ...] | None = None,
+        extra_key_token_start: int | None = None,
+        extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
+    ) -> bool:
+        """Keep an exact Lightning-MTP history at one backbone block boundary.
+
+        This is intentionally memory-only.  SSD persistence would require a
+        versioned serialization contract for every model family's MTP cache;
+        an unsupported or stale sidecar must merely fall back to unprimed MTP,
+        never make the target model consume an invented history.
+        """
+        tip = self._mtp_prefix_chain_tip(
+            tokens,
+            boundary_tokens,
+            extra_keys=extra_keys,
+            extra_key_token_start=extra_key_token_start,
+            extra_key_ranges=extra_key_ranges,
+        )
+        if tip is None or snapshot is None:
+            return False
+        with self._mtp_prefix_snapshot_lock:
+            self._mtp_prefix_snapshots[tip] = (int(boundary_tokens), snapshot)
+            self._mtp_prefix_snapshots.move_to_end(tip)
+            while len(self._mtp_prefix_snapshots) > _MTP_PREFIX_SNAPSHOT_MAX_ENTRIES:
+                self._mtp_prefix_snapshots.popitem(last=False)
+        return True
+
+    def restore_mtp_prefix_snapshot(
+        self,
+        tokens: list[int],
+        boundary_tokens: int,
+        *,
+        extra_keys: tuple[Any, ...] | None = None,
+        extra_key_token_start: int | None = None,
+        extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
+    ) -> Any | None:
+        """Return the exact MTP sidecar matching a reconstructed trunk prefix."""
+        tip = self._mtp_prefix_chain_tip(
+            tokens,
+            boundary_tokens,
+            extra_keys=extra_keys,
+            extra_key_token_start=extra_key_token_start,
+            extra_key_ranges=extra_key_ranges,
+        )
+        if tip is None:
+            return None
+        # A snapshot published before completion is not reusable until the
+        # matching backbone block has actually been stored and remains live.
+        if self.paged_cache.cached_block_hash_to_block.get_block(tip) is None:
+            return None
+        with self._mtp_prefix_snapshot_lock:
+            entry = self._mtp_prefix_snapshots.get(tip)
+            if entry is None or entry[0] != int(boundary_tokens):
+                return None
+            self._mtp_prefix_snapshots.move_to_end(tip)
+            return entry[1]
 
     def get_stats(self) -> PrefixCacheStats:
         """
@@ -4849,9 +5106,15 @@ class BlockAwarePrefixCache(CacheManager):
         Returns:
             Number of entries cleared.
         """
-        cleared_count = len(self._request_tables) + len(self._prefix_index)
+        with self._mtp_prefix_snapshot_lock:
+            mtp_snapshot_count = len(self._mtp_prefix_snapshots)
+        cleared_count = (
+            len(self._request_tables) + len(self._prefix_index) + mtp_snapshot_count
+        )
         self._request_tables.clear()
         self._prefix_index.clear()
+        with self._mtp_prefix_snapshot_lock:
+            self._mtp_prefix_snapshots.clear()
         self.paged_cache.clear()
         self.reset_stats()
         return cleared_count

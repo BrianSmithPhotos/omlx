@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the Qwen3.5/3.6 MoE gate+up fusion patch (issue #2238)."""
+"""Tests for the supported MoE gate+up fusion patch (issue #2238)."""
 
 from __future__ import annotations
 
@@ -35,14 +35,27 @@ class _FakeOtherModel:
 _FakeOtherModel.__module__ = "mlx_lm.models.deepseek_v3"
 
 
-def _make_model(quantize=True, model_cls=_FakeQwenModel, n_blocks=2):
+class _FakeHyV3Model:
+    pass
+
+
+_FakeHyV3Model.__module__ = "mlx_lm.models.hy_v3"
+
+
+def _make_model(
+    quantize=True,
+    model_cls=_FakeQwenModel,
+    n_blocks=2,
+    group_size=32,
+    bits=4,
+):
     mx.random.seed(7)
     blocks = []
     for _ in range(n_blocks):
         glu = SwitchGLU(HIDDEN, INTER, E)
         if quantize:
-            glu.gate_proj = glu.gate_proj.to_quantized(32, 4)
-            glu.up_proj = glu.up_proj.to_quantized(32, 4)
+            glu.gate_proj = glu.gate_proj.to_quantized(group_size, bits)
+            glu.up_proj = glu.up_proj.to_quantized(group_size, bits)
             glu.down_proj = glu.down_proj.to_quantized(32, 4)
         blocks.append(glu)
     model = model_cls()
@@ -145,6 +158,24 @@ def test_laguna_family_fused_bit_exact():
     assert mx.array_equal(ref, out).item()
 
 
+@pytest.mark.parametrize("bits", [5, 6, 8])
+def test_hy_v3_family_fused_bit_exact(bits):
+    """HyV3 uses stock SwitchGLU and receives the same bit-exact fusion."""
+    model = _make_model(model_cls=_FakeHyV3Model, group_size=64, bits=bits)
+    x = (mx.random.normal(shape=(1, 1, HIDDEN)) * 0.5).astype(mx.bfloat16)
+    indices = mx.random.randint(0, E, shape=(1, 1, TOPK))
+
+    ref = _forward_all(model, x, indices)
+    mx.eval(ref)
+
+    assert apply_qwen35_moe_gate_up_fusion(model) == 2
+    out = _forward_all(model, x, indices)
+    mx.eval(out)
+
+    for expected, actual in zip(ref, out):
+        assert mx.array_equal(expected, actual).item()
+
+
 def test_qwen4_exp_family_is_eligible_for_gate_up_fusion():
     model = _make_model(model_cls=_FakeQwen4Model, n_blocks=1)
 
@@ -194,22 +225,27 @@ def test_mismatched_quant_params_skipped():
     assert hasattr(glu, "gate_proj")
 
 
-def test_vlm_target_verify_fused_bit_exact():
-    lang = pytest.importorskip("mlx_vlm.models.qwen3_5_moe.language")
+@pytest.mark.parametrize("length", [1, 3, 64])
+def test_vlm_fused_experts_preserve_decode_verify_and_prefill(length):
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
 
-    model = _make_model(n_blocks=1)
-    glu = model.blocks[0]
-    x = (mx.random.normal(shape=(2, 3, HIDDEN)) * 0.5).astype(mx.bfloat16)
-    idx = mx.random.randint(0, E, shape=(2, 3, TOPK))
-
-    ref = lang._target_verify_switch_glu(glu, x, idx, True)
+    mx.random.seed(7)
+    glu = VLMSwitchGLU(HIDDEN, INTER, E)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        setattr(glu, name, getattr(glu, name).to_quantized(32, 4))
+    glu.eval()
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    x = (mx.random.normal((2, length, HIDDEN)) * 0.5).astype(mx.bfloat16)
+    idx = mx.random.randint(0, E, shape=(2, length, TOPK))
+    weights = mx.full((2, length, TOPK), 0.5)
+    shared = mx.zeros_like(x)
+    ref = glu(x, idx, weights, shared)
     mx.eval(ref)
 
     assert apply_qwen35_moe_gate_up_fusion(model) == 1
-    out = lang._target_verify_switch_glu(glu, x, idx, True)
+    out = glu(x, idx, weights, shared)
     mx.eval(out)
-
-    assert ref.shape == out.shape
     assert mx.array_equal(ref, out).item()
 
 
@@ -228,3 +264,31 @@ def test_weighted_sum_route_accepts_fused_layout():
         pytest.skip("Metal required for _should_route")
     x = mx.zeros((1, 2048, HIDDEN), dtype=mx.bfloat16)
     assert _should_route(_Block(), x, target_verify=False, min_tokens=1024)
+
+
+def test_vlm_fused_projection_views_cross_execution_threads():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    def load():
+        with mx.stream(mx.new_thread_local_stream(mx.gpu)):
+            glu = VLMSwitchGLU(HIDDEN, INTER, E)
+            glu.gate_proj = glu.gate_proj.to_quantized(32, 4)
+            glu.up_proj = glu.up_proj.to_quantized(32, 4)
+            mx.eval(glu.parameters())
+            patch_mod._fuse_one(glu)
+            return glu
+
+    def verify(glu):
+        with mx.stream(mx.new_thread_local_stream(mx.gpu)):
+            x = mx.ones((1, 1, 1, HIDDEN))
+            indices = mx.zeros((1, TOPK), dtype=mx.uint32)
+            outputs = [glu.gate_proj(x, indices), glu.up_proj(x, indices)]
+            mx.eval(outputs)
+            return all(bool(mx.all(mx.isfinite(value)).item()) for value in outputs)
+
+    with ThreadPoolExecutor(max_workers=1) as loader:
+        glu = loader.submit(load).result()
+    with ThreadPoolExecutor(max_workers=1) as decoder:
+        assert decoder.submit(verify, glu).result()
